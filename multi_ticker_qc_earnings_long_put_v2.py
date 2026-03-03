@@ -8,7 +8,7 @@ import math
 # ─── Configurable Parameters ──────────────────────────────────────────────────
 
 N      = 16       # Number of past earnings events per ticker (most recent N)
-K      = 14       # Fixed entry day (trading days before earnings)
+K      = 20       # Fixed entry day (trading days before earnings)
                   # Also used as scan start when DYNAMIC_ENTRY = True
 DYNAMIC_ENTRY = False  # False → enter at exactly K days (original behaviour)
                        # True  → scan from K days, enter on vega/theta signal
@@ -22,44 +22,25 @@ RV_SIGMA = True   # True  → hedge tolerance sigma from live 30-day realized vo
                   # False → hedge tolerance sigma from put IV at entry (fixed for life of trade)
 F      = 0        # Minimum calendar days after earnings date for put expiry
 Z      = 0.0      # IV/RV filter: skip entry if IV/RV >= Z  (0.0 = disabled)
-PRICE_MODEL = "BT"   # Option pricing model for Greeks: "BT" | "BS" | "default"
-                     # BT  = Binomial CoxRossRubinstein (American equity options — recommended)
-                     # BS  = Black-Scholes (European-style, faster, ignores early exercise)
-                     # default = QC built-in (no explicit model set)
+MAX_PUT_PCT = 0.15  # Sanity: skip entry if put_mid > stock_price × MAX_PUT_PCT
+PUT_LIMIT_MULT = 1.2  # Limit order at put_mid × this (prevents bad fills)
+PRICE_MODEL = "default"   # Option pricing model for Greeks: "BT" | "BS" | "default"
+                          # BT  = Binomial CoxRossRubinstein (American equity options — recommended)
+                          # BS  = Black-Scholes (European-style, faster, ignores early exercise)
+                          # default = QC built-in (no explicit model set)
+HOURLY_BARS = False       # True  → Resolution.Hour  (fast, ~50x fewer data points)
+                          # False → Resolution.Minute (precise fills, slower)
+TRADE_TIME_MIN = 270      # Minutes after market open to enter/exit trades
+                          # 270 → 2:00 PM ET,  210 → 1:00 PM ET,  330 → 3:00 PM ET
+HEDGE_TIME_MIN = 15       # Minutes before market close to run delta hedge
+                          # 15 → 3:45 PM ET,  30 → 3:30 PM ET
 
 # ─── Financial Modeling Prep API ──────────────────────────────────────────────
 FMP_API_KEY = ""   # Leave empty to rely solely on MANUAL_EARNINGS_DATES below
 
 # ─── Earnings Dates ───────────────────────────────────────────────────────────
-# Add one key per ticker; the strategy runs on every ticker in this dict.
-# Format: datetime(YYYY, M, D)  — use the announcement date
-#
-# Example:
-#   MANUAL_EARNINGS_DATES = {
-#       "AAPL": [ datetime(2024, 2, 1), datetime(2024, 5, 2), ... ],
-#       "NVDA": [ datetime(2024, 2, 21), datetime(2024, 5, 22), ... ],
-#   }
-
-MANUAL_EARNINGS_DATES = {
-    "AAPL": [
-        datetime(2022, 1, 27),   # Q1 FY2022
-        datetime(2022, 4, 28),   # Q2 FY2022
-        datetime(2022, 7, 28),   # Q3 FY2022
-        datetime(2022, 10, 27),  # Q4 FY2022
-        datetime(2023, 2, 2),    # Q1 FY2023
-        datetime(2023, 5, 4),    # Q2 FY2023
-        datetime(2023, 8, 3),    # Q3 FY2023
-        datetime(2023, 11, 2),   # Q4 FY2023
-        datetime(2024, 2, 1),    # Q1 FY2024
-        datetime(2024, 5, 2),    # Q2 FY2024
-        datetime(2024, 8, 1),    # Q3 FY2024
-        datetime(2024, 10, 31),  # Q4 FY2024
-        datetime(2025, 1, 30),   # Q1 FY2025
-        datetime(2025, 5, 1),    # Q2 FY2025
-        datetime(2025, 7, 31),   # Q3 FY2025
-        datetime(2026, 1, 29),   # Q4 FY2025
-    ],
-}
+# Imported from tickerlist.py — add one key per ticker there.
+from tickerlist import MANUAL_EARNINGS_DATES
 
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -121,24 +102,27 @@ class EarningsLongPutMultiTickerV2(QCAlgorithm):
     def Initialize(self):
         self.SetStartDate(2022, 1, 1)
         self.SetEndDate(2026, 2, 20)
-        self.SetCash(1_000_000)
+        self.SetCash(20_000_000)
 
         tickers = list(MANUAL_EARNINGS_DATES.keys())
 
         # Per-ticker state dict
         self._ts = {}
         self._max_concurrent = 0   # peak number of tickers held simultaneously
+        self._filling_ticker = None  # set around our own orders to distinguish from auto-liquidation
 
         _exp_max = 30 + F + 20   # option chain expiry window
 
         for ticker in tickers:
-            eq  = self.AddEquity(ticker, Resolution.Minute)
-            opt = self.AddOption(ticker, Resolution.Minute)
+            _res = Resolution.Hour if HOURLY_BARS else Resolution.Minute
+            eq  = self.AddEquity(ticker, _res)
+            opt = self.AddOption(ticker, _res)
             opt.SetFilter(lambda u: u.Strikes(-5, 0).Expiration(0, _exp_max).PutsOnly())
             if PRICE_MODEL == "BT":
                 opt.PriceModel = OptionPriceModels.BinomialCoxRossRubinstein()
             elif PRICE_MODEL == "BS":
                 opt.PriceModel = OptionPriceModels.BlackScholes()
+            opt.SetOptionAssignmentModel(NullAssignmentModel())
 
             dates = self._load_earnings_dates(ticker)
             self._log_earnings_dates(ticker, dates)
@@ -151,14 +135,21 @@ class EarningsLongPutMultiTickerV2(QCAlgorithm):
                 "state":           "FLAT",
                 "put_symbol":      None,
                 "put_contracts":   0,
-                "put_entry_price": 0.0,
+                "put_entry_fill":  0.0,
+                "put_exit_fill":   0.0,
                 "put_entry_iv":    0.0,
+                "put_order_ticket": None,
+                "pending_hedge_shares": 0,
                 "stock_qty":       0,
                 "stock_cost_basis": 0.0,
                 "stock_realized":  0.0,
                 "last_hedge_price": 0.0,
                 "entry_earnings":  None,
                 "entry_rv":        0.0,
+                "iv_min":          None,
+                "iv_min_date":     None,
+                "iv_max":          None,
+                "iv_max_date":     None,
                 # chain cache
                 "chain": None,
                 # dynamic entry scan state
@@ -169,17 +160,18 @@ class EarningsLongPutMultiTickerV2(QCAlgorithm):
                 "earnings_dates":  dates,
                 "traded_earnings": set(),
                 "trade_log":       [],
+                "force_exited":    False,
             }
 
             # Scheduled events — capture ticker in default arg
             self.Schedule.On(
                 self.DateRules.EveryDay(ticker),
-                self.TimeRules.AfterMarketOpen(ticker, 5),
+                self.TimeRules.AfterMarketOpen(ticker, TRADE_TIME_MIN),
                 lambda t=ticker: self._manage_position(t),
             )
             self.Schedule.On(
                 self.DateRules.EveryDay(ticker),
-                self.TimeRules.BeforeMarketClose(ticker, 30),
+                self.TimeRules.BeforeMarketClose(ticker, HEDGE_TIME_MIN),
                 lambda t=ticker: self._delta_hedge(t),
             )
 
@@ -227,10 +219,79 @@ class EarningsLongPutMultiTickerV2(QCAlgorithm):
             if ts["option_symbol"] in data.OptionChains:
                 ts["chain"] = data.OptionChains[ts["option_symbol"]]
 
-    # ── Position management (5 min after open) ────────────────────────────────
+            # ── Stock split detection ───────────────────────────────────
+            if data.Splits.ContainsKey(ts["stock_symbol"]):
+                split = data.Splits[ts["stock_symbol"]]
+                if split.Type == SplitType.SplitOccurred:
+                    # Always adjust qty so avg_cost stays correct post-split
+                    # (cost_basis unchanged ÷ fewer shares = correct post-split avg)
+                    if ts["state"] in ("ACTIVE", "EMERGENCY_PENDING"):
+                        if ts["stock_qty"] > 0 and split.SplitFactor > 0:
+                            ts["stock_qty"] = round(ts["stock_qty"] / split.SplitFactor)
+                    # Only trigger emergency exit if not already pending
+                    if ts["state"] == "ACTIVE" and not ts.get("force_exited"):
+                        self._emergency_exit(ticker, f"{ticker} split {split.SplitFactor}")
+
+    # ── Order fill tracking ──────────────────────────────────────────────────
+
+    def OnOrderEvent(self, orderEvent):
+        if orderEvent.Status != OrderStatus.Filled:
+            return
+
+        symbol     = orderEvent.Symbol
+        fill_price = orderEvent.FillPrice
+        fill_qty   = orderEvent.FillQuantity   # +buy / −sell
+
+        for ticker, ts in self._ts.items():
+            if ts["state"] not in ("ACTIVE", "EMERGENCY_PENDING"):
+                continue
+
+            # ── Put fill ──────────────────────────────────────────────
+            if symbol == ts.get("put_symbol"):
+                if fill_qty > 0:
+                    ts["put_entry_fill"] = fill_price
+                    # Place deferred stock hedge now that put is filled
+                    pending = ts.get("pending_hedge_shares", 0)
+                    if pending > 0:
+                        self._filling_ticker = ticker
+                        self.MarketOrder(ts["stock_symbol"], pending)
+                        self._filling_ticker = None
+                        ts["pending_hedge_shares"] = 0
+                else:
+                    ts["put_exit_fill"] = fill_price
+                    # Detect auto-liquidation: put sold but NOT by our code
+                    if self._filling_ticker != ticker and not ts.get("force_exited"):
+                        self.Log(f"  [{self.Time.date()}] AUTO-LIQUIDATION detected: "
+                                 f"put {symbol} sold at ${fill_price:.2f} (likely stock split)")
+                        self._emergency_exit(ticker, "stock split / auto-liquidation")
+                return
+
+            # ── Stock fill ────────────────────────────────────────────
+            if symbol == ts["stock_symbol"]:
+                if fill_qty > 0:
+                    ts["stock_cost_basis"] += fill_qty * fill_price
+                    ts["stock_qty"]        += fill_qty
+                else:
+                    sold = abs(fill_qty)
+                    if ts["stock_qty"] > 0:
+                        avg_cost = ts["stock_cost_basis"] / ts["stock_qty"]
+                    else:
+                        avg_cost = fill_price
+                    ts["stock_realized"]   += (fill_price - avg_cost) * sold
+                    ts["stock_cost_basis"] -= avg_cost * sold
+                    ts["stock_qty"]        -= sold
+                return
+
+    # ── Position management (10:00 AM — 30 min after open) ────────────────────
 
     def _manage_position(self, ticker):
         ts = self._ts[ticker]
+
+        # ── Finalize any emergency exit from a stock split ──────────
+        if ts["state"] == "EMERGENCY_PENDING":
+            self._finalize_emergency_exit(ticker)
+            return
+
         if not ts["earnings_dates"]:
             return
 
@@ -322,6 +383,12 @@ class EarningsLongPutMultiTickerV2(QCAlgorithm):
         if put_mid <= 0:
             return
 
+        # Sanity check: skip if put price is unreasonably high vs underlying
+        if MAX_PUT_PCT > 0 and put_mid > s_price * MAX_PUT_PCT:
+            self.Log(f"  [{ticker}] SKIP — put_mid ${put_mid:.2f} > "
+                     f"{MAX_PUT_PCT:.0%} of stock ${s_price:.2f}")
+            return
+
         n_contracts = max(1, int(S / (put_mid * 100)))
 
         # ── Realized volatility + IV/RV filter ───────────────────────────────
@@ -336,25 +403,33 @@ class EarningsLongPutMultiTickerV2(QCAlgorithm):
             if cur_iv / rv >= Z:
                 return
 
-        self.MarketOrder(put.Symbol, n_contracts)
-
         delta    = put.Greeks.Delta
         n_shares = max(0, round(abs(n_contracts * 100 * delta)))
-        s_mid    = _mid(stock.BidPrice, stock.AskPrice)
-        if n_shares > 0:
-            self.MarketOrder(ts["stock_symbol"], n_shares)
 
+        # Activate BEFORE placing orders so OnOrderEvent can track fills
         ts["state"]            = "ACTIVE"
         ts["put_symbol"]       = put.Symbol
         ts["put_contracts"]    = n_contracts
-        ts["put_entry_price"]  = put_mid
+        ts["put_entry_fill"]   = 0.0
+        ts["put_exit_fill"]    = 0.0
         ts["put_entry_iv"]     = cur_iv
-        ts["stock_qty"]        = n_shares
-        ts["stock_cost_basis"] = n_shares * s_mid
+        ts["stock_qty"]        = 0
+        ts["stock_cost_basis"] = 0.0
         ts["stock_realized"]   = 0.0
-        ts["last_hedge_price"] = s_price
-        ts["entry_earnings"]   = earnings_dt
-        ts["entry_rv"]         = rv
+        ts["last_hedge_price"]  = s_price
+        ts["stock_entry_price"] = s_price
+        ts["entry_earnings"]    = earnings_dt
+        ts["entry_rv"]          = rv
+        ts["iv_min"]            = ts["put_entry_iv"]
+        ts["iv_min_date"]       = self.Time.date()
+        ts["iv_max"]            = ts["put_entry_iv"]
+        ts["iv_max_date"]       = self.Time.date()
+
+        # Place limit order for put; stock hedge deferred until put fills
+        ts["pending_hedge_shares"] = n_shares
+        limit_px = round(put_mid * PUT_LIMIT_MULT, 2)
+        ticket = self.LimitOrder(put.Symbol, n_contracts, limit_px)
+        ts["put_order_ticket"] = ticket
 
         # Track peak concurrent positions
         active = sum(1 for t in self._ts.values() if t["state"] == "ACTIVE")
@@ -367,49 +442,71 @@ class EarningsLongPutMultiTickerV2(QCAlgorithm):
         ts = self._ts[ticker]
         if ts["state"] != "ACTIVE":
             return
+        if ts.get("force_exited"):
+            return   # already emergency-closed (e.g. stock split)
 
-        stock = self.Securities[ts["stock_symbol"]]
-        s_mid = _mid(stock.BidPrice, stock.AskPrice)
-
-        put_mid     = 0.0
+        # Read exit IV from chain (for logging + min/max tracking)
         put_exit_iv = 0.0
         if ts["chain"]:
             for c in ts["chain"]:
                 if c.Symbol == ts["put_symbol"]:
-                    put_mid = _mid(c.BidPrice, c.AskPrice)
                     try:
                         put_exit_iv = c.ImpliedVolatility
                     except Exception:
                         put_exit_iv = 0.0
                     break
 
-        if put_mid == 0.0:
-            try:
-                ps      = self.Securities[ts["put_symbol"]]
-                put_mid = _mid(ps.BidPrice, ps.AskPrice)
-            except Exception:
-                pass
+        # Update IV min/max with exit-day reading
+        if put_exit_iv > 0:
+            if ts["iv_min"] is None or put_exit_iv < ts["iv_min"]:
+                ts["iv_min"] = put_exit_iv
+                ts["iv_min_date"] = self.Time.date()
+            if ts["iv_max"] is None or put_exit_iv >= ts["iv_max"]:
+                ts["iv_max"] = put_exit_iv
+                ts["iv_max_date"] = self.Time.date()
 
-        if ts["put_contracts"] > 0:
-            self.MarketOrder(ts["put_symbol"], -ts["put_contracts"])
-        if ts["stock_qty"] > 0:
-            self.MarketOrder(ts["stock_symbol"], -ts["stock_qty"])
+        # Save quantities before orders (OnOrderEvent will zero them out)
+        n_contracts = ts["put_contracts"]
+        n_shares    = ts["stock_qty"]
 
-        put_pnl   = (put_mid - ts["put_entry_price"]) * ts["put_contracts"] * 100
-        stk_unr   = ts["stock_qty"] * s_mid - ts["stock_cost_basis"]
-        stk_pnl   = ts["stock_realized"] + stk_unr
+        # Place exit orders — OnOrderEvent captures actual fill prices
+        self._filling_ticker = ticker
+        if n_contracts > 0:
+            self.MarketOrder(ts["put_symbol"], -n_contracts)
+        if n_shares > 0:
+            self.MarketOrder(ts["stock_symbol"], -n_shares)
+        self._filling_ticker = None
+
+        # PnL from actual fill prices (set by OnOrderEvent)
+        put_pnl   = (ts["put_exit_fill"] - ts["put_entry_fill"]) * n_contracts * 100
+        stk_pnl   = ts["stock_realized"]
         total_pnl = put_pnl + stk_pnl
+
+        # Stock % change
+        entry_px = ts["stock_entry_price"]
+        exit_px  = self.Securities[ts["stock_symbol"]].Price
+        stk_chg_pct = ((exit_px - entry_px) / entry_px * 100) if entry_px > 0 else 0.0
 
         ed = ts["entry_earnings"].date()
 
+        iv_min_date = ts.get("iv_min_date")
+        iv_min_days = (ed - iv_min_date).days if iv_min_date else 0
+        iv_max_date = ts.get("iv_max_date")
+        iv_max_days = (ed - iv_max_date).days if iv_max_date else 0
+
         ts["trade_log"].append({
-            "earnings": ed,
-            "put_pnl":  put_pnl,
-            "stk_pnl":  stk_pnl,
-            "total":    total_pnl,
-            "iv_entry": ts["put_entry_iv"],
-            "iv_exit":  put_exit_iv,
-            "rv":       ts["entry_rv"],
+            "earnings":           ed,
+            "put_pnl":            put_pnl,
+            "stk_pnl":            stk_pnl,
+            "stk_chg_pct":        stk_chg_pct,
+            "total":              total_pnl,
+            "iv_entry":           ts["put_entry_iv"],
+            "iv_exit":            put_exit_iv,
+            "rv":                 ts["entry_rv"],
+            "iv_min":             ts.get("iv_min", 0.0) or 0.0,
+            "iv_min_days_before": iv_min_days,
+            "iv_max":             ts.get("iv_max", 0.0) or 0.0,
+            "iv_max_days_before": iv_max_days,
         })
         ts["traded_earnings"].add(ed)
         self._reset(ticker)
@@ -432,6 +529,32 @@ class EarningsLongPutMultiTickerV2(QCAlgorithm):
                     self._scan_entry(ticker, ed_dt)
                     break
 
+        # ── Cancel unfilled put limit order if still pending ─────────────
+        if ts["state"] == "ACTIVE" and ts.get("put_entry_fill", 0) == 0:
+            ticket = ts.get("put_order_ticket")
+            if ticket is not None:
+                ticket.Cancel()
+                self.Log(f"  [{ticker}] Limit order for put did not fill — cancelling and resetting")
+                self._reset(ticker)
+                return
+
+        # ── Warm-up: if position exits tomorrow, re-subscribe the put now
+        #    so it has price data by the 10:00 AM exit order tomorrow ───────
+        if ts["state"] == "ACTIVE" and ts.get("put_symbol") is not None:
+            today = self.Time.date()
+            for ed_dt in reversed(ts["earnings_dates"]):
+                ed = ed_dt.date() if isinstance(ed_dt, datetime) else ed_dt
+                if ed in ts["traded_earnings"]:
+                    continue
+                exit_day = self._offset_trading_days(ticker, ed, -1)
+                if exit_day is not None:
+                    # Check if exit is tomorrow (next trading day)
+                    tomorrow = self._offset_trading_days(ticker, today, 1)
+                    if tomorrow == exit_day:
+                        _res = Resolution.Hour if HOURLY_BARS else Resolution.Minute
+                        self.AddOptionContract(ts["put_symbol"], _res)
+                break
+
         if ts["state"] != "ACTIVE" or ts["chain"] is None:
             return
 
@@ -442,17 +565,15 @@ class EarningsLongPutMultiTickerV2(QCAlgorithm):
 
         # ── Step 1: Compute live position delta ──────────────────────────────
         # Find the current put Greeks from the live chain
-        cur_delta   = None
-        cur_iv      = 0.0
-        cur_put_mid = 0.0
+        cur_delta = None
+        cur_iv    = 0.0
         for c in ts["chain"]:
             if c.Symbol == ts["put_symbol"]:
-                cur_delta   = c.Greeks.Delta
+                cur_delta = c.Greeks.Delta
                 try:
-                    cur_iv  = c.ImpliedVolatility
+                    cur_iv = c.ImpliedVolatility
                 except Exception:
-                    cur_iv  = 0.0
-                cur_put_mid = _mid(c.BidPrice, c.AskPrice)
+                    cur_iv = 0.0
                 break
 
         if cur_delta is None:
@@ -460,6 +581,15 @@ class EarningsLongPutMultiTickerV2(QCAlgorithm):
 
         if cur_delta == 0.0 and cur_iv == 0.0:
             return
+
+        # Track IV min / max over the life of the trade
+        if cur_iv > 0:
+            if ts["iv_min"] is None or cur_iv < ts["iv_min"]:
+                ts["iv_min"] = cur_iv
+                ts["iv_min_date"] = self.Time.date()
+            if ts["iv_max"] is None or cur_iv >= ts["iv_max"]:
+                ts["iv_max"] = cur_iv
+                ts["iv_max_date"] = self.Time.date()
 
         # Stock delta = number of shares (each share has delta +1)
         stock_delta = ts["stock_qty"]
@@ -500,26 +630,12 @@ class EarningsLongPutMultiTickerV2(QCAlgorithm):
         if adj == 0:
             return
 
-        s_mid = _mid(stock.BidPrice, stock.AskPrice)
+        self._filling_ticker = ticker
         self.MarketOrder(ts["stock_symbol"], adj)
+        self._filling_ticker = None
+        # OnOrderEvent handles stock_qty, stock_cost_basis, stock_realized
 
-        if adj > 0:
-            ts["stock_cost_basis"] += adj * s_mid
-        else:
-            sold     = abs(adj)
-            avg_cost = ts["stock_cost_basis"] / ts["stock_qty"] if ts["stock_qty"] else s_mid
-            ts["stock_realized"]   += (s_mid - avg_cost) * sold
-            ts["stock_cost_basis"] -= avg_cost * sold
-
-        ts["stock_qty"]        = target
         ts["last_hedge_price"] = s_price   # kept for reference / logging
-
-        put_pnl   = (cur_put_mid - ts["put_entry_price"]) * ts["put_contracts"] * 100
-        stk_unr   = ts["stock_qty"] * s_mid - ts["stock_cost_basis"]
-        stk_pnl   = ts["stock_realized"] + stk_unr
-        total_pnl = put_pnl + stk_pnl
-
-        pass  # hedge details suppressed — summary in OnEndOfAlgorithm
 
     # ── Helpers ───────────────────────────────────────────────────────────────
 
@@ -575,22 +691,100 @@ class EarningsLongPutMultiTickerV2(QCAlgorithm):
         except Exception:
             return 0.0
 
+    # ── Emergency exit (stock split / auto-liquidation) ─────────────────────
+
+    def _emergency_exit(self, ticker, reason):
+        """Mark one ticker's position as EMERGENCY_PENDING.
+        Does NOT place orders or calculate P&L — deferred to _finalize_emergency_exit."""
+        ts = self._ts[ticker]
+        if ts["state"] != "ACTIVE" or ts.get("force_exited"):
+            return
+        ts["force_exited"] = True
+        ts["state"]        = "EMERGENCY_PENDING"
+        self.Log(f"  [{self.Time.date()}] EMERGENCY EXIT ({reason}): "
+                 f"ticker={ticker} (pending close)")
+
+    def _finalize_emergency_exit(self, ticker):
+        """Called from _manage_position when state is EMERGENCY_PENDING.
+        Sells remaining stock, calculates P&L, logs the trade, and resets."""
+        ts = self._ts[ticker]
+        if ts["state"] != "EMERGENCY_PENDING":
+            return
+
+        self.Log(f"  [{self.Time.date()}] FINALIZING EMERGENCY EXIT for {ticker}")
+
+        # ── Close remaining stock position ──────────────────────────
+        actual_stock_qty = 0
+        if self.Portfolio.ContainsKey(ts["stock_symbol"]):
+            actual_stock_qty = self.Portfolio[ts["stock_symbol"]].Quantity
+
+        if actual_stock_qty != 0:
+            self._filling_ticker = ticker
+            self.MarketOrder(ts["stock_symbol"], -actual_stock_qty)
+            self._filling_ticker = None
+
+        # ── P&L calculation ─────────────────────────────────────────
+        n_contracts = ts["put_contracts"]
+        put_pnl = (ts["put_exit_fill"] - ts["put_entry_fill"]) * n_contracts * 100
+        stk_pnl = ts["stock_realized"]
+        total   = put_pnl + stk_pnl
+
+        self.Log(f"  [{self.Time.date()}]  PutPnL=${put_pnl:+,.2f} StkPnL=${stk_pnl:+,.2f} Total=${total:+,.2f}")
+
+        # Stock % change
+        entry_px = ts["stock_entry_price"]
+        exit_px  = self.Securities[ts["stock_symbol"]].Price if entry_px > 0 else 0.0
+        stk_chg_pct = ((exit_px - entry_px) / entry_px * 100) if entry_px > 0 else 0.0
+
+        ed = ts["entry_earnings"].date() if ts["entry_earnings"] else self.Time.date()
+
+        iv_min_date = ts.get("iv_min_date")
+        iv_min_days = (ed - iv_min_date).days if iv_min_date else 0
+        iv_max_date = ts.get("iv_max_date")
+        iv_max_days = (ed - iv_max_date).days if iv_max_date else 0
+
+        ts["trade_log"].append({
+            "earnings":           ed,
+            "put_pnl":            put_pnl,
+            "stk_pnl":            stk_pnl,
+            "stk_chg_pct":        stk_chg_pct,
+            "total":              total,
+            "iv_entry":           ts["put_entry_iv"],
+            "iv_exit":            0.0,
+            "rv":                 ts["entry_rv"],
+            "iv_min":             ts.get("iv_min", 0.0) or 0.0,
+            "iv_min_days_before": iv_min_days,
+            "iv_max":             ts.get("iv_max", 0.0) or 0.0,
+            "iv_max_days_before": iv_max_days,
+        })
+        ts["traded_earnings"].add(ed)
+        self._reset(ticker)
+
     def _reset(self, ticker):
         ts = self._ts[ticker]
         ts["state"]            = "FLAT"
         ts["put_symbol"]       = None
         ts["put_contracts"]    = 0
-        ts["put_entry_price"]  = 0.0
+        ts["put_entry_fill"]   = 0.0
+        ts["put_exit_fill"]    = 0.0
         ts["put_entry_iv"]     = 0.0
+        ts["put_order_ticket"] = None
+        ts["pending_hedge_shares"] = 0
         ts["stock_qty"]        = 0
         ts["stock_cost_basis"] = 0.0
         ts["stock_realized"]   = 0.0
-        ts["last_hedge_price"] = 0.0
-        ts["entry_earnings"]   = None
+        ts["last_hedge_price"]  = 0.0
+        ts["stock_entry_price"] = 0.0
+        ts["entry_earnings"]    = None
         ts["iv_samples"]       = []
         ts["iv_avg"]           = None
         ts["scan_earnings"]    = None
         ts["entry_rv"]         = 0.0
+        ts["iv_min"]           = None
+        ts["iv_min_date"]      = None
+        ts["iv_max"]           = None
+        ts["iv_max_date"]      = None
+        ts["force_exited"]     = False
 
     # ── End-of-backtest summary ───────────────────────────────────────────────
 
@@ -611,38 +805,57 @@ class EarningsLongPutMultiTickerV2(QCAlgorithm):
                 continue
 
             totals = {"put": 0.0, "stk": 0.0, "total": 0.0}
-            wins   = sum(1 for t in trade_log if t["total"] >= 0)
-            grand_trades += n
+            valid  = [t for t in trade_log if t["iv_exit"] != 0.0]
+            wins   = sum(1 for t in valid if t["total"] >= 0)
+            nv     = len(valid)
+            grand_trades += nv
             grand_wins   += wins
 
-            self.Log(f"  {ticker} SUMMARY  |  {n} trade(s)  |  Wins: {wins}/{n}")
+            self.Log(f"  {ticker} SUMMARY  |  {nv} trade(s)  |  Wins: {wins}/{nv}  (skipped {n - nv} w/ iv_exit=0)")
             self.Log(f"{'─'*72}")
-            self.Log(f"  {'Earnings':<12} {'Put PnL':>12} {'Stock PnL':>12} {'Combined':>12}   IV entry → exit  IV chg    IV/RV")
-            self.Log(f"  {'─'*88}")
+            self.Log(f"  {'Earnings':<12} {'Put PnL':>12} {'Stock PnL':>12} {'Stk Chg%':>9} {'Combined':>12} {'IV entry':>9} {'IV exit':>8} {'IV min':>7} {'MinD':>5} {'IV max':>7} {'MaxD':>5} {'IV chg':>7} {'IV/RV':>6}")
+            self.Log(f"  {'─'*122}")
 
+            skipped = 0
             for t in trade_log:
+                if t["iv_exit"] == 0.0:
+                    skipped += 1
+                    continue
                 tag    = "[+]" if t["total"] >= 0 else "[-]"
                 rv     = t.get("rv", 0.0)
-                ratio  = f"{t['iv_entry'] / rv:.2f}x" if rv > 0 else "n/a"
+                ratio  = f"{t['iv_entry'] / rv:.2f}" if rv > 0 else "n/a"
                 iv_chg = (t['iv_exit'] - t['iv_entry']) / t['iv_entry'] * 100 if t['iv_entry'] > 0 else 0.0
+                chg    = t.get("stk_chg_pct", 0.0)
+                iv_min = t.get("iv_min", 0.0)
+                mind   = t.get("iv_min_days_before", 0)
+                iv_max = t.get("iv_max", 0.0)
+                maxd   = t.get("iv_max_days_before", 0)
                 self.Log(
                     f"  {tag} {t['earnings']!s:<11}"
                     f"  ${t['put_pnl']:>+10,.2f}"
                     f"  ${t['stk_pnl']:>+10,.2f}"
+                    f"  {chg:>+7.1f}%"
                     f"  ${t['total']:>+10,.2f}"
-                    f"   {t['iv_entry']:.1%} → {t['iv_exit']:.1%}"
+                    f"  {t['iv_entry']:>8.1%}"
+                    f"  {t['iv_exit']:>7.1%}"
+                    f"  {iv_min:>6.1%}"
+                    f"  {mind:>5}"
+                    f"  {iv_max:>6.1%}"
+                    f"  {maxd:>5}"
                     f"  {iv_chg:>+6.0f}%"
-                    f"    {ratio}"
+                    f"  {ratio:>6}"
                 )
                 totals["put"]   += t["put_pnl"]
                 totals["stk"]   += t["stk_pnl"]
                 totals["total"] += t["total"]
 
-            avg = totals["total"] / n
-            self.Log(f"  {'─'*88}")
+            printed = n - skipped
+            avg = totals["total"] / printed if printed > 0 else 0.0
+            self.Log(f"  {'─'*122}")
             self.Log(
                 f"  {'TOTAL':<15}  ${totals['put']:>+10,.2f}"
                 f"  ${totals['stk']:>+10,.2f}"
+                f"  {'':>9}"
                 f"  ${totals['total']:>+10,.2f}"
             )
             self.Log(f"  Avg PnL/trade: ${avg:+,.2f}")
@@ -658,10 +871,37 @@ class EarningsLongPutMultiTickerV2(QCAlgorithm):
 
 # ─── Mid-price fill model ─────────────────────────────────────────────────────
 
+class NullAssignmentModel(DefaultOptionAssignmentModel):
+    """Never trigger automatic option assignment — the algo manages all exits."""
+    def GetAssignment(self, parameters):
+        return OptionAssignmentResult.Null
+
+
 class MidPriceFillModel(ImmediateFillModel):
     def MarketFill(self, asset, order):
         fill = ImmediateFillModel.MarketFill(self, asset, order)
         mid  = _mid(asset.BidPrice, asset.AskPrice)
         if mid > 0:
+            fill.FillPrice = round(mid, 2)
+        return fill
+
+    def LimitFill(self, asset, order):
+        mid = _mid(asset.BidPrice, asset.AskPrice)
+        if mid <= 0:
+            return super().LimitFill(asset, order)
+        _no_fill = getattr(OrderStatus, 'None')   # avoid Python keyword
+        # Buy limit: fill at mid only if mid ≤ limit price
+        if order.Quantity > 0 and mid > order.LimitPrice:
+            return OrderEvent(order.Id, order.Symbol, asset.LocalTime,
+                              _no_fill, order.Direction,
+                              0, 0, OrderFee.Zero, "mid above limit")
+        # Sell limit: fill at mid only if mid ≥ limit price
+        if order.Quantity < 0 and mid < order.LimitPrice:
+            return OrderEvent(order.Id, order.Symbol, asset.LocalTime,
+                              _no_fill, order.Direction,
+                              0, 0, OrderFee.Zero, "mid below limit")
+        # Condition met — fill at mid
+        fill = super().LimitFill(asset, order)
+        if fill.Status == OrderStatus.Filled:
             fill.FillPrice = round(mid, 2)
         return fill
