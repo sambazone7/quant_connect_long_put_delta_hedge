@@ -66,6 +66,7 @@ with open(args.csvfile, "r", encoding="utf-8", errors="replace") as f:
         iv_rv      = parse_float(row.get("iv_rv", ""))
         ivspread   = pct(row.get("ivspread", ""))
         shiv_rv    = parse_float(row.get("shiv_rv", ""))
+        iv_change  = pct(row.get("iv_change", ""))
 
         rows.append({
             "ticker":      row["ticker"],
@@ -80,6 +81,7 @@ with open(args.csvfile, "r", encoding="utf-8", errors="replace") as f:
             "iv_rv":       iv_rv,
             "ivspread":    ivspread,
             "shiv_rv":     shiv_rv,
+            "iv_change":   iv_change,
             "win":         win,
         })
 
@@ -98,18 +100,25 @@ def write_bucket(label, bucket):
     avg     = total / n
     med     = statistics.median([r["combined"] for r in bucket])
     wins    = sum(r["win"] for r in bucket)
-    avg_l   = sum(r["long_pnl"] for r in bucket) / n
-    avg_s   = sum(r["short_pnl"] for r in bucket) / n
-    avg_stk = sum(r["stk_pnl"] for r in bucket) / n
+    tot_l   = sum(r["long_pnl"] for r in bucket)
+    tot_s   = sum(r["short_pnl"] for r in bucket)
+    tot_stk = sum(r["stk_pnl"] for r in bucket)
+    avg_l   = tot_l / n
+    avg_s   = tot_s / n
+    avg_stk = tot_stk / n
     out.write(f"{label}:\n")
-    out.write(f"  Trades:        {n}\n")
-    out.write(f"  Total PnL:     ${total:>+14,.2f}\n")
-    out.write(f"  Avg PnL:       ${avg:>+14,.2f}\n")
-    out.write(f"  Median PnL:    ${med:>+14,.2f}\n")
-    out.write(f"  Win rate:      {wins/n:.1%}  ({wins}/{n})\n")
-    out.write(f"  Avg Long PnL:  ${avg_l:>+14,.2f}\n")
-    out.write(f"  Avg Short PnL: ${avg_s:>+14,.2f}\n")
-    out.write(f"  Avg Stk PnL:   ${avg_stk:>+14,.2f}\n")
+    out.write(f"  Trades:         {n}\n")
+    out.write(f"  Total PnL:      ${total:>+14,.2f}\n")
+    out.write(f"  Avg PnL:        ${avg:>+14,.2f}\n")
+    out.write(f"  Median PnL:     ${med:>+14,.2f}\n")
+    out.write(f"  Win rate:       {wins/n:.1%}  ({wins}/{n})\n")
+    out.write(f"  Total Long PnL: ${tot_l:>+14,.2f}\n")
+    out.write(f"  Total Short PnL:${tot_s:>+14,.2f}\n")
+    out.write(f"  Total Stk PnL:  ${tot_stk:>+14,.2f}\n")
+    out.write(f"  ---\n")
+    out.write(f"  Avg Long PnL:   ${avg_l:>+14,.2f}\n")
+    out.write(f"  Avg Short PnL:  ${avg_s:>+14,.2f}\n")
+    out.write(f"  Avg Stk PnL:    ${avg_stk:>+14,.2f}\n")
     out.write("\n")
 
 def write_band_row(label, bucket):
@@ -179,6 +188,44 @@ out.write("=" * 80 + "\n")
 out.write("1. OVERALL SUMMARY\n")
 out.write("=" * 80 + "\n\n")
 write_bucket("All calendar trades", rows)
+
+# ════════════════════════════════════════════════════════════════════════════
+# 1b. TOP 10 BEST & WORST TRADES
+# ════════════════════════════════════════════════════════════════════════════
+
+def _fmt(v, fmt_str, suffix="", na="n/a"):
+    """Format a value, returning 'n/a' if None."""
+    if v is None:
+        return na.rjust(len(na))
+    return f"{v:{fmt_str}}{suffix}"
+
+def write_top_table(label, trade_list):
+    out.write(f"\n{label}:\n")
+    hdr = (f"  {'Ticker':<7} {'Earnings':>10}  {'Long PnL':>12} {'Short PnL':>12} "
+           f"{'Stock PnL':>12} {'StkChg%':>8} {'Combined':>12}  "
+           f"{'IVent':>7} {'IVexit':>7} {'IVspr':>7} {'ShIV/RV':>7} {'IVchg':>7} {'IV/RV':>6}\n")
+    out.write(hdr)
+    out.write("  " + "-" * (len(hdr) - 3) + "\n")
+    for r in trade_list:
+        out.write(
+            f"  {r['ticker']:<7} {r['earnings']:>10}"
+            f"  ${r['long_pnl']:>+11,.0f} ${r['short_pnl']:>+11,.0f}"
+            f" ${r['stk_pnl']:>+11,.0f}"
+            f"  {_fmt(r['stk_chg_pct'], '+.1f', '%'):>7}"
+            f" ${r['combined']:>+11,.0f}"
+            f"  {_fmt(r['iv_entry'], '.1%'):>7}"
+            f" {_fmt(r['iv_exit'], '.1%'):>7}"
+            f" {_fmt(r['ivspread'], '.1%'):>7}"
+            f" {_fmt(r['shiv_rv'], '.2f'):>7}"
+            f" {_fmt(r['iv_change'], '+.0%'):>7}"
+            f" {_fmt(r['iv_rv'], '.2f'):>6}"
+            f"\n"
+        )
+
+sorted_by_pnl = sorted(rows, key=lambda r: r["combined"])
+write_top_table("TOP 20 WORST TRADES", sorted_by_pnl[:20])
+write_top_table("TOP 20 BEST TRADES", sorted_by_pnl[-20:][::-1])
+out.write("\n")
 
 # ════════════════════════════════════════════════════════════════════════════
 # 2. EFFECT OF IV ENTRY ON PROFIT/LOSS

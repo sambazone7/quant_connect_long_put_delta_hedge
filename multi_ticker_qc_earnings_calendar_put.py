@@ -8,9 +8,10 @@ import math
 # ─── Configurable Parameters ──────────────────────────────────────────────────
 
 N      = 16       # Number of past earnings events per ticker (most recent N)
-K      = 20       # Fixed entry day (trading days before earnings)
+K      = 25       # Fixed entry day (trading days before earnings)
 S      = 10_000   # Notional USD value of calendar spread at entry (per ticker)
                   # Sized by net debit: n_contracts = S / (net_debit × 100)
+MIN_NET_DEBIT = 0.75   # Skip trade if long_mid - short_mid < this (dollars)
 D_mult  = 1.0    # Delta-tolerance scalar: tolerance = D_mult × daily_sigma_frac × |option_exposure|
                   # e.g. 1.0 → tolerate up to 1 daily-sigma of delta drift before re-hedging
 RV_SIGMA = True   # True  → hedge tolerance sigma from live 30-day realized vol (refreshed daily)
@@ -457,6 +458,9 @@ class EarningsCalendarPutMultiTicker(QCAlgorithm):
         if net_debit <= 0:
             self._log(f"  [{ticker}] SKIP — net debit <= 0 "
                      f"(long={long_mid:.2f}, short={short_mid:.2f})")
+            return
+        if net_debit < MIN_NET_DEBIT:
+            self._log(f"  [{ticker}] SKIP — net debit ${net_debit:.2f} < min ${MIN_NET_DEBIT:.2f}")
             return
 
         # Sanity check: skip if long put price unreasonably high vs underlying
