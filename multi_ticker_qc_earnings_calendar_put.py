@@ -12,6 +12,7 @@ K      = 25       # Fixed entry day (trading days before earnings)
 S      = 10_000   # Notional USD value of calendar spread at entry (per ticker)
                   # Sized by net debit: n_contracts = S / (net_debit × 100)
 MIN_NET_DEBIT = 0.75   # Skip trade if long_mid - short_mid < this (dollars)
+DELTA_HEDGE = True   # True → delta-hedge with stock daily;  False → no stock hedging
 D_mult  = 1.0    # Delta-tolerance scalar: tolerance = D_mult × daily_sigma_frac × |option_exposure|
                   # e.g. 1.0 → tolerate up to 1 daily-sigma of delta drift before re-hedging
 RV_SIGMA = True   # True  → hedge tolerance sigma from live 30-day realized vol (refreshed daily)
@@ -686,6 +687,9 @@ class EarningsCalendarPutMultiTicker(QCAlgorithm):
                         self.AddOptionContract(ts["short_put_symbol"], _res)
 
         if ts["state"] != "ACTIVE" or ts["chain"] is None:
+            return
+
+        if not DELTA_HEDGE:
             return
 
         stock   = self.Securities[ts["stock_symbol"]]

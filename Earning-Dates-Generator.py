@@ -4,10 +4,11 @@ from collections import defaultdict
 import time
 
 tickers = [
-"CEG","CMCSA","ADP","MELI","DASH","SBUX","SNPS","CDNS","MAR","ABNB","REGN",
-"CTAS","MRVL","WBD","MDLZ","ADSK","FTNT","ROST","WDAY","NXPI","PYPL","EA",
-"DDOG","TTWO","TEAM","GEHC","ZS","MDB","MCHP","KHC","BIIB","DXCM","DLTR",
-"LULU","ON","TTD","SMCI"
+"AAPL","GOOGL","GOOG","MSFT","AMZN","TSLA","META","AVGO","BRK.B","LLY",
+"WMT","JPM","V","ORCL","MA","XOM","JNJ","ABBV","BAC","NFLX",
+"COST","AMD","HD","PG","GE","CSCO","CVX","KO","UNH","WFC",
+"IBM","CAT","GS","MRK","PM","CRM","TMO","MCD","ABT","ISRG",
+"PEP","INTU","QCOM","AMGN","ACN","NOW","TXN","ADBE"
 ]
 
 start = datetime(2022, 1, 1)
