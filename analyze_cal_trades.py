@@ -8,12 +8,14 @@ Usage:
     python analyze_cal_trades.py trades.csv                → cal-stats.out
     python analyze_cal_trades.py trades.csv -o myfile.out  → custom output
 """
-import csv, sys, statistics, argparse
+import csv, sys, re, statistics, argparse
 
 parser = argparse.ArgumentParser(description="Analyse calendar-spread trades CSV")
 parser.add_argument("csvfile", help="Input trades CSV (from parse_log.py)")
 parser.add_argument("-o", "--output", default=None,
                     help="Output file path (default: cal-stats.out)")
+parser.add_argument("--log", default=None,
+                    help="Optional: raw QC log file to extract skip counts from")
 args = parser.parse_args()
 
 out_path = args.output or "cal-stats.out"
@@ -68,9 +70,17 @@ with open(args.csvfile, "r", encoding="utf-8", errors="replace") as f:
         shiv_rv    = parse_float(row.get("shiv_rv", ""))
         iv_change  = pct(row.get("iv_change", ""))
 
+        n_contracts = int(row["n_contracts"]) if row.get("n_contracts", "").strip() else 0
+
+        _lse = int(row["long_spread_entry"])  if row.get("long_spread_entry",  "").strip() else 0
+        _sse = int(row["short_spread_entry"]) if row.get("short_spread_entry", "").strip() else 0
+        _lsx = int(row["long_spread_exit"])   if row.get("long_spread_exit",   "").strip() else 0
+        _ssx = int(row["short_spread_exit"])  if row.get("short_spread_exit",  "").strip() else 0
+
         rows.append({
             "ticker":      row["ticker"],
             "earnings":    row["earnings"],
+            "n_contracts": n_contracts,
             "combined":    combined,
             "long_pnl":    long_pnl,
             "short_pnl":   short_pnl,
@@ -83,10 +93,68 @@ with open(args.csvfile, "r", encoding="utf-8", errors="replace") as f:
             "shiv_rv":     shiv_rv,
             "iv_change":   iv_change,
             "win":         win,
+            "long_spread_entry":  _lse,
+            "short_spread_entry": _sse,
+            "long_spread_exit":   _lsx,
+            "short_spread_exit":  _ssx,
         })
 
+# ── Parse skip counts from raw log (optional) ────────────────────────────────
+
+_skip_totals_re = re.compile(
+    r'SKIP TOTALS:\s*(\d+)\s+attempted\s*\|\s*(\d+)\s+traded\s*\|\s*(\d+)\s+skipped\s*'
+    r'\(no_pair=(\d+),\s*low_debit=(\d+),\s*other=(\d+)\)'
+)
+_skip_ticker_re = re.compile(
+    r'Entries attempted:\s*(\d+)\s*\|\s*Skipped:\s*(\d+)\s*'
+    r'\(no_pair=(\d+),\s*low_debit=(\d+),\s*other=(\d+)\)'
+)
+_summary_re = re.compile(r'(\w+)\s+SUMMARY\s*\|')
+
+skip_grand   = None     # dict with grand totals
+skip_by_ticker = {}     # ticker → {attempted, skipped, no_pair, low_debit, other}
+
+if args.log:
+    try:
+        with open(args.log, "r", encoding="utf-8", errors="replace") as lf:
+            _cur_tkr = None
+            for ln in lf:
+                m = _summary_re.search(ln)
+                if m:
+                    _cur_tkr = m.group(1)
+                m = _skip_ticker_re.search(ln)
+                if m and _cur_tkr:
+                    skip_by_ticker[_cur_tkr] = {
+                        "attempted": int(m.group(1)), "skipped": int(m.group(2)),
+                        "no_pair": int(m.group(3)), "low_debit": int(m.group(4)),
+                        "other": int(m.group(5)),
+                    }
+                m = _skip_totals_re.search(ln)
+                if m:
+                    skip_grand = {
+                        "attempted": int(m.group(1)), "traded": int(m.group(2)),
+                        "skipped": int(m.group(3)), "no_pair": int(m.group(4)),
+                        "low_debit": int(m.group(5)), "other": int(m.group(6)),
+                    }
+    except Exception as e:
+        print(f"Warning: could not read log file {args.log}: {e}")
+
 out = open(out_path, "w", encoding="utf-8")
-out.write(f"Total calendar trades: {len(rows)}\n\n")
+out.write(f"Total calendar trades: {len(rows)}\n")
+
+# ── Skip summary at top of report ─────────────────────────────────────────
+if skip_grand:
+    g = skip_grand
+    out.write(f"\nENTRY SKIP SUMMARY ({g['attempted']} earnings events attempted):\n")
+    out.write(f"  Traded:     {g['traded']:>5}\n")
+    out.write(f"  Skipped:    {g['skipped']:>5}  "
+              f"(no_pair={g['no_pair']}, low_debit={g['low_debit']}, other={g['other']})\n")
+    if g['attempted'] > 0:
+        out.write(f"  Trade rate: {g['traded']/g['attempted']:.1%}\n")
+    out.write(f"\n  no_pair    = no weekly options or no valid ATM pair\n")
+    out.write(f"  low_debit  = net debit <= 0 or < MIN_NET_DEBIT\n")
+    out.write(f"  other      = bad price / MAX_PUT_PCT exceeded / IV/RV filter\n")
+out.write("\n")
 
 # ── Reporting helpers ────────────────────────────────────────────────────────
 
@@ -201,14 +269,16 @@ def _fmt(v, fmt_str, suffix="", na="n/a"):
 
 def write_top_table(label, trade_list):
     out.write(f"\n{label}:\n")
-    hdr = (f"  {'Ticker':<7} {'Earnings':>10}  {'Long PnL':>12} {'Short PnL':>12} "
+    hdr = (f"  {'Ticker':<7} {'Earnings':>10} {'n':>5}  {'Long PnL':>12} {'Short PnL':>12} "
            f"{'Stock PnL':>12} {'StkChg%':>8} {'Combined':>12}  "
-           f"{'IVent':>7} {'IVexit':>7} {'IVspr':>7} {'ShIV/RV':>7} {'IVchg':>7} {'IV/RV':>6}\n")
+           f"{'IVent':>7} {'IVexit':>7} {'IVspr':>7} {'ShIV/RV':>7} {'IVchg':>7} {'IV/RV':>6}"
+           f" {'LSpEn':>7} {'SSpEn':>7} {'LSpEx':>7} {'SSpEx':>7}\n")
     out.write(hdr)
     out.write("  " + "-" * (len(hdr) - 3) + "\n")
     for r in trade_list:
+        nc = r.get("n_contracts", 0)
         out.write(
-            f"  {r['ticker']:<7} {r['earnings']:>10}"
+            f"  {r['ticker']:<7} {r['earnings']:>10} {nc:>5}"
             f"  ${r['long_pnl']:>+11,.0f} ${r['short_pnl']:>+11,.0f}"
             f" ${r['stk_pnl']:>+11,.0f}"
             f"  {_fmt(r['stk_chg_pct'], '+.1f', '%'):>7}"
@@ -219,12 +289,16 @@ def write_top_table(label, trade_list):
             f" {_fmt(r['shiv_rv'], '.2f'):>7}"
             f" {_fmt(r['iv_change'], '+.0%'):>7}"
             f" {_fmt(r['iv_rv'], '.2f'):>6}"
+            f" {r.get('long_spread_entry', 0):>7}"
+            f" {r.get('short_spread_entry', 0):>7}"
+            f" {r.get('long_spread_exit', 0):>7}"
+            f" {r.get('short_spread_exit', 0):>7}"
             f"\n"
         )
 
 sorted_by_pnl = sorted(rows, key=lambda r: r["combined"])
-write_top_table("TOP 20 WORST TRADES", sorted_by_pnl[:20])
-write_top_table("TOP 20 BEST TRADES", sorted_by_pnl[-20:][::-1])
+write_top_table("TOP 50 WORST TRADES", sorted_by_pnl[:50])
+write_top_table("TOP 50 BEST TRADES", sorted_by_pnl[-50:][::-1])
 out.write("\n")
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -418,6 +492,29 @@ for label, filt in stk_bands:
 out.write("-" * 88 + "\n")
 write_band_row("ALL (with Stk Chg%)", stk_rows)
 out.write("\n")
+
+# ════════════════════════════════════════════════════════════════════════════
+# 8. PER-TICKER SKIP BREAKDOWN (from --log)
+# ════════════════════════════════════════════════════════════════════════════
+
+if skip_by_ticker:
+    out.write("=" * 80 + "\n")
+    out.write("8. PER-TICKER ENTRY SKIP BREAKDOWN\n")
+    out.write("=" * 80 + "\n\n")
+    out.write(f"  {'Ticker':<8} {'Attempted':>9} {'Traded':>7} {'Skipped':>8}  "
+              f"{'no_pair':>8} {'low_dbt':>8} {'other':>6}\n")
+    out.write("  " + "-" * 62 + "\n")
+    for tkr in sorted(skip_by_ticker.keys()):
+        s = skip_by_ticker[tkr]
+        traded = s["attempted"] - s["skipped"]
+        out.write(f"  {tkr:<8} {s['attempted']:>9} {traded:>7} {s['skipped']:>8}  "
+                  f"{s['no_pair']:>8} {s['low_debit']:>8} {s['other']:>6}\n")
+    out.write("  " + "-" * 62 + "\n")
+    if skip_grand:
+        g = skip_grand
+        out.write(f"  {'TOTAL':<8} {g['attempted']:>9} {g['traded']:>7} {g['skipped']:>8}  "
+                  f"{g['no_pair']:>8} {g['low_debit']:>8} {g['other']:>6}\n")
+    out.write("\n")
 
 out.close()
 print(f"Analysis -> {out_path}  ({len(rows)} calendar trades)")
