@@ -8,23 +8,7 @@ from cal_config import *
 
 class EarningsCalendarPutMultiTicker(QCAlgorithm):
     """
-    Multi-ticker Earnings Calendar Put Spread + Delta-Neutral Strategy
-    ===================================================================
-    K trading days before earnings:
-      - Buy ATM put expiring AFTER earnings  (long put)
-      - Sell ATM put expiring BEFORE earnings (short put) at the SAME strike
-      - Both expirations must be ≤ MAX_SPREAD_DAYS apart (weekly options)
-
-    Delta hedge the combined calendar delta daily (before close):
-      1. option_delta = (long_delta − short_delta) × n_contracts × 100
-      2. daily_sigma_frac = RV or entry IV / sqrt(252)
-      3. tolerance = D_mult × daily_sigma_frac × |option_exposure|
-      4. If |position_delta| > tolerance → hedge to delta-neutral
-
-    Exit 1 trading day before the short put expires — close both puts + stock.
-
-    Sizing: n_contracts = S / (net_debit × 100)
-            where net_debit = long_put_mid − short_put_mid
+    
     """
 
     # ── Initialise ────────────────────────────────────────────────────────────

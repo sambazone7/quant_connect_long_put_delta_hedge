@@ -8,7 +8,7 @@ import math
 # ─── Configurable Parameters ──────────────────────────────────────────────────
 
 N      = 16       # Number of past earnings events per ticker (most recent N)
-K      = 20       # Fixed entry day (trading days before earnings)
+K      = 15       # Fixed entry day (trading days before earnings)
                   # Also used as scan start when DYNAMIC_ENTRY = True
 DYNAMIC_ENTRY = False  # False → enter at exactly K days (original behaviour)
                        # True  → scan from K days, enter on vega/theta signal
@@ -21,9 +21,14 @@ D_mult  = 1.0    # Delta-tolerance scalar: tolerance = D_mult × daily_sigma_fra
 RV_SIGMA = True   # True  → hedge tolerance sigma from live 30-day realized vol (refreshed daily)
                   # False → hedge tolerance sigma from put IV at entry (fixed for life of trade)
 F      = 0        # Minimum calendar days after earnings date for put expiry
+EXPIRE_SERIES = 0  # 0 → closest expiry after earnings (default)
+                   # 1 → second closest weekly expiry after earnings
+                   #     (falls back to closest if no weeklies available)
 Z      = 0.0      # IV/RV filter: skip entry if IV/RV >= Z  (0.0 = disabled)
 MAX_PUT_PCT = 0.15  # Sanity: skip entry if put_mid > stock_price × MAX_PUT_PCT
 PUT_LIMIT_MULT = 1.2  # Limit order at put_mid × this (prevents bad fills)
+SPREAD_CUTOFF_PCT = 0.20  # Max bid-ask spread as fraction of option mid price (0.20 = 20%)
+                          # Skip entry if |bid-ask| / mid > this.  0 = disabled.
 PRICE_MODEL = "default"   # Option pricing model for Greeks: "BT" | "BS" | "default"
                           # BT  = Binomial CoxRossRubinstein (American equity options — recommended)
                           # BS  = Black-Scholes (European-style, faster, ignores early exercise)
@@ -40,7 +45,7 @@ FMP_API_KEY = ""   # Leave empty to rely solely on MANUAL_EARNINGS_DATES below
 
 # ─── Earnings Dates ───────────────────────────────────────────────────────────
 # Imported from tickerlist.py — add one key per ticker there.
-from tickerlist import MANUAL_EARNINGS_DATES
+from listqqqAll import MANUAL_EARNINGS_DATES
 
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -161,6 +166,11 @@ class EarningsLongPutMultiTickerV2(QCAlgorithm):
                 "traded_earnings": set(),
                 "trade_log":       [],
                 "force_exited":    False,
+                "call_symbol":     None,
+                "iv_early_put":    0.0,
+                "put_spread_entry": 0,
+                "put_spread_exit": 0,
+                "call_spread_exit": 0,
             }
 
             # Scheduled events — capture ticker in default arg
@@ -391,6 +401,16 @@ class EarningsLongPutMultiTickerV2(QCAlgorithm):
 
         n_contracts = max(1, int(S / (put_mid * 100)))
 
+        # ── Bid-ask spread cutoff (percentage of mid) ────────────────────────
+        put_spread_raw = abs(put.BidPrice - put.AskPrice)
+        spread_pct = put_spread_raw / put_mid if put_mid > 0 else 999
+        put_spread_cost = put_spread_raw * 100 * n_contracts
+        if SPREAD_CUTOFF_PCT > 0 and spread_pct > SPREAD_CUTOFF_PCT:
+            self.Log(f"  [{ticker}] SKIP — spread too wide "
+                     f"({spread_pct:.1%} of mid, cutoff={SPREAD_CUTOFF_PCT:.0%})")
+            return
+        ts["put_spread_entry"] = round(put_spread_cost)
+
         # ── Realized volatility + IV/RV filter ───────────────────────────────
         rv = self._calc_realized_vol(ts["stock_symbol"], 30)
 
@@ -398,6 +418,23 @@ class EarningsLongPutMultiTickerV2(QCAlgorithm):
             cur_iv = put.ImpliedVolatility
         except Exception:
             cur_iv = 0.0
+
+        # ── IV term-structure: find same-strike put expiring ~1 week earlier ──
+        early_iv = 0.0
+        target_expiry = put.Expiry.date() - timedelta(days=7)
+        candidates = [
+            c for c in ts["chain"]
+            if c.Right == OptionRight.Put
+            and c.Strike == put.Strike
+            and c.Expiry.date() < put.Expiry.date()
+        ]
+        if candidates:
+            best = min(candidates, key=lambda c: abs((c.Expiry.date() - target_expiry).days))
+            try:
+                early_iv = best.ImpliedVolatility
+            except Exception:
+                early_iv = 0.0
+        ts["iv_early_put"] = early_iv
 
         if Z > 0 and rv > 0:
             if cur_iv / rv >= Z:
@@ -424,6 +461,19 @@ class EarningsLongPutMultiTickerV2(QCAlgorithm):
         ts["iv_min_date"]       = self.Time.date()
         ts["iv_max"]            = ts["put_entry_iv"]
         ts["iv_max_date"]       = self.Time.date()
+
+        # Subscribe to the call at the same strike/expiry as the put (for sim PnL at exit)
+        _res = Resolution.Hour if HOURLY_BARS else Resolution.Minute
+        call_symbol = Symbol.CreateOption(
+            ts["stock_symbol"],
+            put.Symbol.ID.Market,
+            OptionStyle.American,
+            OptionRight.Call,
+            put.Strike,
+            put.Expiry,
+        )
+        self.AddOptionContract(call_symbol, _res)
+        ts["call_symbol"] = call_symbol
 
         # Place limit order for put; stock hedge deferred until put fills
         ts["pending_hedge_shares"] = n_shares
@@ -469,6 +519,13 @@ class EarningsLongPutMultiTickerV2(QCAlgorithm):
         n_contracts = ts["put_contracts"]
         n_shares    = ts["stock_qty"]
 
+        # Record exit bid-ask spread costs before closing
+        try:
+            _put_sec = self.Securities[ts["put_symbol"]]
+            ts["put_spread_exit"] = round(abs(_put_sec.BidPrice - _put_sec.AskPrice) * 100 * n_contracts)
+        except Exception:
+            ts["put_spread_exit"] = 0
+
         # Place exit orders — OnOrderEvent captures actual fill prices
         self._filling_ticker = ticker
         if n_contracts > 0:
@@ -482,9 +539,29 @@ class EarningsLongPutMultiTickerV2(QCAlgorithm):
         stk_pnl   = ts["stock_realized"]
         total_pnl = put_pnl + stk_pnl
 
+        # ── Sim PnL (fair-value put exit + stock hedge PnL) ──────────────
+        s_price = self.Securities[ts["stock_symbol"]].Price
+        strike  = self.Securities[ts["put_symbol"]].Symbol.ID.StrikePrice
+        call_sym = ts.get("call_symbol")
+
+        if s_price >= strike:
+            effective_exit = _mid(_put_sec.BidPrice, _put_sec.AskPrice)
+        else:
+            call_mid = 0.0
+            if call_sym and self.Securities.ContainsKey(call_sym):
+                _call_sec = self.Securities[call_sym]
+                call_mid = _mid(_call_sec.BidPrice, _call_sec.AskPrice)
+                ts["call_spread_exit"] = round(abs(_call_sec.BidPrice - _call_sec.AskPrice) * 100 * n_contracts)
+            effective_exit = (strike - s_price) + call_mid
+
+        if effective_exit > 0 and ts["put_entry_fill"] > 0:
+            sim_pnl = (effective_exit - ts["put_entry_fill"]) * n_contracts * 100 + stk_pnl
+        else:
+            sim_pnl = 0.0
+
         # Stock % change
         entry_px = ts["stock_entry_price"]
-        exit_px  = self.Securities[ts["stock_symbol"]].Price
+        exit_px  = s_price
         stk_chg_pct = ((exit_px - entry_px) / entry_px * 100) if entry_px > 0 else 0.0
 
         ed = ts["entry_earnings"].date()
@@ -500,6 +577,7 @@ class EarningsLongPutMultiTickerV2(QCAlgorithm):
             "stk_pnl":            stk_pnl,
             "stk_chg_pct":        stk_chg_pct,
             "total":              total_pnl,
+            "iv_early_put":       ts["iv_early_put"],
             "iv_entry":           ts["put_entry_iv"],
             "iv_exit":            put_exit_iv,
             "rv":                 ts["entry_rv"],
@@ -507,6 +585,10 @@ class EarningsLongPutMultiTickerV2(QCAlgorithm):
             "iv_min_days_before": iv_min_days,
             "iv_max":             ts.get("iv_max", 0.0) or 0.0,
             "iv_max_days_before": iv_max_days,
+            "sim_pnl":            sim_pnl,
+            "put_spread_entry":   ts["put_spread_entry"],
+            "put_spread_exit":    ts["put_spread_exit"],
+            "call_spread_exit":   ts["call_spread_exit"],
         })
         ts["traded_earnings"].add(ed)
         self._reset(ticker)
@@ -553,6 +635,8 @@ class EarningsLongPutMultiTickerV2(QCAlgorithm):
                     if tomorrow == exit_day:
                         _res = Resolution.Hour if HOURLY_BARS else Resolution.Minute
                         self.AddOptionContract(ts["put_symbol"], _res)
+                        if ts.get("call_symbol"):
+                            self.AddOptionContract(ts["call_symbol"], _res)
                 break
 
         if ts["state"] != "ACTIVE" or ts["chain"] is None:
@@ -749,6 +833,7 @@ class EarningsLongPutMultiTickerV2(QCAlgorithm):
             "stk_pnl":            stk_pnl,
             "stk_chg_pct":        stk_chg_pct,
             "total":              total,
+            "iv_early_put":       ts["iv_early_put"],
             "iv_entry":           ts["put_entry_iv"],
             "iv_exit":            0.0,
             "rv":                 ts["entry_rv"],
@@ -756,6 +841,10 @@ class EarningsLongPutMultiTickerV2(QCAlgorithm):
             "iv_min_days_before": iv_min_days,
             "iv_max":             ts.get("iv_max", 0.0) or 0.0,
             "iv_max_days_before": iv_max_days,
+            "sim_pnl":            0.0,
+            "put_spread_entry":   ts["put_spread_entry"],
+            "put_spread_exit":    0,
+            "call_spread_exit":   0,
         })
         ts["traded_earnings"].add(ed)
         self._reset(ticker)
@@ -785,10 +874,21 @@ class EarningsLongPutMultiTickerV2(QCAlgorithm):
         ts["iv_max"]           = None
         ts["iv_max_date"]      = None
         ts["force_exited"]     = False
+        ts["call_symbol"]      = None
+        ts["iv_early_put"]     = 0.0
+        ts["put_spread_entry"] = 0
+        ts["put_spread_exit"]  = 0
+        ts["call_spread_exit"] = 0
 
     # ── End-of-backtest summary ───────────────────────────────────────────────
 
+    def _ol(self, lines, msg):
+        """Log a message AND collect it for ObjectStore persistence."""
+        self.Log(msg)
+        lines.append(msg)
+
     def OnEndOfAlgorithm(self):
+        lines = []          # collected for ObjectStore (bypasses 100 KB log cap)
         grand_total = 0.0
 
         grand_trades = 0
@@ -798,23 +898,31 @@ class EarningsLongPutMultiTickerV2(QCAlgorithm):
             trade_log = self._ts[ticker]["trade_log"]
             n         = len(trade_log)
 
-            self.Log(f"{'═'*72}")
+            self._ol(lines, f"{'═'*72}")
             if n == 0:
-                self.Log(f"  {ticker} SUMMARY  |  No trades completed")
-                self.Log(f"{'═'*72}")
+                self._ol(lines, f"  {ticker} SUMMARY  |  No trades completed")
+                self._ol(lines, f"{'═'*72}")
                 continue
 
-            totals = {"put": 0.0, "stk": 0.0, "total": 0.0}
+            totals = {"put": 0.0, "stk": 0.0, "total": 0.0, "sim": 0.0}
             valid  = [t for t in trade_log if t["iv_exit"] != 0.0]
             wins   = sum(1 for t in valid if t["total"] >= 0)
             nv     = len(valid)
             grand_trades += nv
             grand_wins   += wins
 
-            self.Log(f"  {ticker} SUMMARY  |  {nv} trade(s)  |  Wins: {wins}/{nv}  (skipped {n - nv} w/ iv_exit=0)")
-            self.Log(f"{'─'*72}")
-            self.Log(f"  {'Earnings':<12} {'Put PnL':>12} {'Stock PnL':>12} {'Stk Chg%':>9} {'Combined':>12} {'IV entry':>9} {'IV exit':>8} {'IV min':>7} {'MinD':>5} {'IV max':>7} {'MaxD':>5} {'IV chg':>7} {'IV/RV':>6}")
-            self.Log(f"  {'─'*122}")
+            self._ol(lines, f"  {ticker} SUMMARY  |  {nv} trade(s)  |  Wins: {wins}/{nv}  (skipped {n - nv} w/ iv_exit=0)")
+            self._ol(lines, f"{'─'*72}")
+            self._ol(lines,
+                f"  {'Earnings':<12}"
+                f" {'Put PnL':>12} {'Stock PnL':>12} {'Stk Chg%':>9} {'Combined':>12}"
+                f" {'SimPnL':>12}"
+                f" {'IVdif':>7}"
+                f" {'IV entry':>9} {'IV exit':>8} {'IV min':>7} {'MinD':>5} {'IV max':>7} {'MaxD':>5}"
+                f" {'IV chg':>7} {'IV/RV':>6} {'neIVR':>6}"
+                f" {'PSpEn':>7} {'PSpEx':>7} {'CSpEx':>7}"
+            )
+            self._ol(lines, f"  {'─'*166}")
 
             skipped = 0
             for t in trade_log:
@@ -830,12 +938,21 @@ class EarningsLongPutMultiTickerV2(QCAlgorithm):
                 mind   = t.get("iv_min_days_before", 0)
                 iv_max = t.get("iv_max", 0.0)
                 maxd   = t.get("iv_max_days_before", 0)
-                self.Log(
+                _sim   = t.get("sim_pnl", 0.0)
+                _eiv     = t.get("iv_early_put", 0.0)
+                _ivdif   = f"{(t['iv_entry'] - _eiv)*100:>5.1f}%" if _eiv > 0 else "    n/a"
+                ne_ratio = f"{_eiv / rv:.2f}" if _eiv > 0 and rv > 0 else "n/a"
+                _pse   = t.get("put_spread_entry", 0)
+                _psx   = t.get("put_spread_exit", 0)
+                _csx   = t.get("call_spread_exit", 0)
+                self._ol(lines,
                     f"  {tag} {t['earnings']!s:<11}"
                     f"  ${t['put_pnl']:>+10,.2f}"
                     f"  ${t['stk_pnl']:>+10,.2f}"
                     f"  {chg:>+7.1f}%"
                     f"  ${t['total']:>+10,.2f}"
+                    f"  ${_sim:>+10,.2f}"
+                    f"  {_ivdif:>7}"
                     f"  {t['iv_entry']:>8.1%}"
                     f"  {t['iv_exit']:>7.1%}"
                     f"  {iv_min:>6.1%}"
@@ -844,29 +961,38 @@ class EarningsLongPutMultiTickerV2(QCAlgorithm):
                     f"  {maxd:>5}"
                     f"  {iv_chg:>+6.0f}%"
                     f"  {ratio:>6}"
+                    f"  {ne_ratio:>6}"
+                    f"  {_pse:>7}"
+                    f"  {_psx:>7}"
+                    f"  {_csx:>7}"
                 )
                 totals["put"]   += t["put_pnl"]
                 totals["stk"]   += t["stk_pnl"]
                 totals["total"] += t["total"]
+                totals["sim"]   += _sim
 
             printed = n - skipped
             avg = totals["total"] / printed if printed > 0 else 0.0
-            self.Log(f"  {'─'*122}")
-            self.Log(
+            self._ol(lines, f"  {'─'*150}")
+            self._ol(lines,
                 f"  {'TOTAL':<15}  ${totals['put']:>+10,.2f}"
                 f"  ${totals['stk']:>+10,.2f}"
                 f"  {'':>9}"
                 f"  ${totals['total']:>+10,.2f}"
+                f"  ${totals['sim']:>+10,.2f}"
             )
-            self.Log(f"  Avg PnL/trade: ${avg:+,.2f}")
-            self.Log(f"{'═'*72}")
+            self._ol(lines, f"  Avg PnL/trade: ${avg:+,.2f}")
+            self._ol(lines, f"{'═'*72}")
             grand_total += totals["total"]
 
         if len(self._ts) > 1:
-            self.Log(f"{'═'*72}")
-            self.Log(f"  ALL TICKERS COMBINED  |  {grand_trades} trade(s)  |  Wins: {grand_wins}/{grand_trades}  |  Max concurrent positions: {self._max_concurrent}")
-            self.Log(f"  Combined PnL: ${grand_total:+,.2f}  |  Avg PnL/trade: ${grand_total / grand_trades:+,.2f}" if grand_trades else f"  Combined PnL: ${grand_total:+,.2f}")
-            self.Log(f"{'═'*72}")
+            self._ol(lines, f"{'═'*72}")
+            self._ol(lines, f"  ALL TICKERS COMBINED  |  {grand_trades} trade(s)  |  Wins: {grand_wins}/{grand_trades}  |  Max concurrent positions: {self._max_concurrent}")
+            self._ol(lines, f"  Combined PnL: ${grand_total:+,.2f}  |  Avg PnL/trade: ${grand_total / grand_trades:+,.2f}" if grand_trades else f"  Combined PnL: ${grand_total:+,.2f}")
+            self._ol(lines, f"{'═'*72}")
+
+        # ── Persist full log to ObjectStore (no 100 KB cap) ──────────────
+        self.ObjectStore.Save("backtest_logs", "\n".join(lines))
 
 
 # ─── Mid-price fill model ─────────────────────────────────────────────────────

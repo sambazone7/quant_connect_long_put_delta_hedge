@@ -11,6 +11,7 @@ Auto-detects log format:
   - Old arrow-style       (IV entry → exit, no stk_chg% or iv_min/max)
 """
 import re, sys, argparse
+from collections import defaultdict
 
 parser = argparse.ArgumentParser(description="Parse QC earnings log → CSV")
 parser.add_argument("logfile", help="Input log file (.txt)")
@@ -97,6 +98,53 @@ cal_new_re = re.compile(
     r'(\d+\.?\d+)\s+'                        # 12 shiv_rv
     r'([+-]\d+)%\s+'                         # 13 iv_change
     r'(\d+\.?\d+)'                           # 14 iv_rv
+)
+
+# ── Single-put: FULL format (SimPnL + IVdif + neIVR + PSpEn/PSpEx/CSpEx) ──
+# Example: [+] 2022-04-28  $+27,439.00  $-25,403.34  -10.8%  $+2,035.66  $+2,070.16  4.0%  28.2%  69.6%  27.0%  27  69.6%  1  +147%  0.88  0.76  230  460  23
+sp_full_re = re.compile(
+    r'\[([+-])\]\s+'                          # 1  win/loss
+    r'(\d{4}-\d{2}-\d{2})\s+'                # 2  date
+    r'\$\s*([+-]?[\d,]+\.\d+)\s+'            # 3  put_pnl
+    r'\$\s*([+-]?[\d,]+\.\d+)\s+'            # 4  stock_pnl
+    r'([+-]?\d+\.?\d*)%\s+'                  # 5  stk_chg_pct
+    r'\$\s*([+-]?[\d,]+\.\d+)\s+'            # 6  combined
+    r'\$\s*([+-]?[\d,]+\.\d+)\s+'            # 7  sim_pnl
+    r'(?:([+-]?\d+\.?\d*)%|n/a)\s+'          # 8  iv_diff (can be n/a)
+    r'(\d+\.?\d*)%\s+'                       # 9  iv_entry
+    r'(\d+\.?\d*)%\s+'                       # 10 iv_exit
+    r'(\d+\.?\d*)%\s+'                       # 11 iv_min
+    r'(\d+)\s+'                              # 12 MinD
+    r'(\d+\.?\d*)%\s+'                       # 13 iv_max
+    r'(\d+)\s+'                              # 14 MaxD
+    r'([+-]\d+)%\s+'                         # 15 iv_change
+    r'(\d+\.?\d+)\s+'                        # 16 iv_rv
+    r'(?:(?:(\d+\.\d+)|n/a)\s+)?'            # 17 ne_iv_rv (optional, requires decimal)
+    r'(\d+)\s+'                              # 18 put_spread_entry
+    r'(\d+)\s+'                              # 19 put_spread_exit
+    r'(\d+)'                                 # 20 call_spread_exit
+)
+
+# ── Single-put: SimPnL format WITHOUT IVdif/neIVR (older logs with SimPnL) ──
+sp_sim_re = re.compile(
+    r'\[([+-])\]\s+'                          # 1  win/loss
+    r'(\d{4}-\d{2}-\d{2})\s+'                # 2  date
+    r'\$\s*([+-]?[\d,]+\.\d+)\s+'            # 3  put_pnl
+    r'\$\s*([+-]?[\d,]+\.\d+)\s+'            # 4  stock_pnl
+    r'([+-]?\d+\.?\d*)%\s+'                  # 5  stk_chg_pct
+    r'\$\s*([+-]?[\d,]+\.\d+)\s+'            # 6  combined
+    r'\$\s*([+-]?[\d,]+\.\d+)\s+'            # 7  sim_pnl
+    r'(\d+\.?\d*)%\s+'                       # 8  iv_entry
+    r'(\d+\.?\d*)%\s+'                       # 9  iv_exit
+    r'(\d+\.?\d*)%\s+'                       # 10 iv_min
+    r'(?:(\d+)\s+)?'                         # 11 optional MinD
+    r'(\d+\.?\d*)%\s+'                       # 12 iv_max
+    r'(\d+)\s+'                              # 13 MaxD
+    r'([+-]\d+)%\s+'                         # 14 iv_change
+    r'(\d+\.?\d+)\s+'                        # 15 iv_rv
+    r'(\d+)\s+'                              # 16 put_spread_entry
+    r'(\d+)\s+'                              # 17 put_spread_exit
+    r'(\d+)'                                 # 18 call_spread_exit
 )
 
 # ── Single-put: NEW format (separate IV cols, stk_chg%, iv_min, iv_max) ────
@@ -218,6 +266,7 @@ for line in lines:
                 "short_spread_entry": m.group(16),
                 "long_spread_exit":   m.group(17),
                 "short_spread_exit":  m.group(18),
+                "sim_pnl": "", "iv_diff": "", "non_earn_iv_rv": "", "call_spread_exit": "",
             })
             continue
 
@@ -244,6 +293,7 @@ for line in lines:
                 "short_spread_entry": "",
                 "long_spread_exit":   "",
                 "short_spread_exit":  "",
+                "sim_pnl": "", "iv_diff": "", "non_earn_iv_rv": "", "call_spread_exit": "",
             })
             continue
 
@@ -270,11 +320,75 @@ for line in lines:
                 "short_spread_entry": "",
                 "long_spread_exit":   "",
                 "short_spread_exit":  "",
+                "sim_pnl": "", "iv_diff": "", "non_earn_iv_rv": "", "call_spread_exit": "",
             })
             continue
 
     # --- Single-put formats ---
     if current_format in ("singleput", None):
+        # Try full format first (SimPnL + IVdif + neIVR + spreads)
+        m = sp_full_re.search(line)
+        if m:
+            rows.append({
+                "ticker":       current_ticker,
+                "win":          "Win" if m.group(1) == "+" else "Loss",
+                "earnings":     m.group(2),
+                "n_contracts":  "",
+                "long_pnl":     "",
+                "short_pnl":    "",
+                "put_pnl":      clean(m.group(3)),
+                "stock_pnl":    clean(m.group(4)),
+                "stk_chg_pct":  m.group(5),
+                "combined":     clean(m.group(6)),
+                "sim_pnl":      clean(m.group(7)),
+                "iv_diff":      m.group(8) + "%" if m.group(8) else "",
+                "iv_entry":     m.group(9) + "%",
+                "iv_exit":      m.group(10) + "%",
+                "ivspread":     "",
+                "shiv_rv":      "",
+                "iv_change":    m.group(15) + "%",
+                "iv_rv":        m.group(16),
+                "non_earn_iv_rv": m.group(17) or "",
+                "long_spread_entry":  m.group(18),
+                "short_spread_entry": "",
+                "long_spread_exit":   m.group(19),
+                "short_spread_exit":  "",
+                "call_spread_exit":   m.group(20),
+            })
+            continue
+
+        # Try SimPnL format without IVdif/neIVR
+        m = sp_sim_re.search(line)
+        if m:
+            rows.append({
+                "ticker":       current_ticker,
+                "win":          "Win" if m.group(1) == "+" else "Loss",
+                "earnings":     m.group(2),
+                "n_contracts":  "",
+                "long_pnl":     "",
+                "short_pnl":    "",
+                "put_pnl":      clean(m.group(3)),
+                "stock_pnl":    clean(m.group(4)),
+                "stk_chg_pct":  m.group(5),
+                "combined":     clean(m.group(6)),
+                "sim_pnl":      clean(m.group(7)),
+                "iv_diff":      "",
+                "iv_entry":     m.group(8) + "%",
+                "iv_exit":      m.group(9) + "%",
+                "ivspread":     "",
+                "shiv_rv":      "",
+                "iv_change":    m.group(14) + "%",
+                "iv_rv":        m.group(15),
+                "non_earn_iv_rv": "",
+                "long_spread_entry":  m.group(16),
+                "short_spread_entry": "",
+                "long_spread_exit":   m.group(17),
+                "short_spread_exit":  "",
+                "call_spread_exit":   m.group(18),
+            })
+            continue
+
+        # Older format (no SimPnL, no IVdif, no spreads)
         m = sp_new_re.search(line)
         if m:
             rows.append({
@@ -288,19 +402,24 @@ for line in lines:
                 "stock_pnl":    clean(m.group(4)),
                 "stk_chg_pct":  m.group(5),
                 "combined":     clean(m.group(6)),
+                "sim_pnl":      "",
+                "iv_diff":      "",
                 "iv_entry":     m.group(7) + "%",
                 "iv_exit":      m.group(8) + "%",
                 "ivspread":     "",
                 "shiv_rv":      "",
                 "iv_change":    m.group(13) + "%",
                 "iv_rv":        m.group(14),
+                "non_earn_iv_rv": "",
                 "long_spread_entry":  "",
                 "short_spread_entry": "",
                 "long_spread_exit":   "",
                 "short_spread_exit":  "",
+                "call_spread_exit":   "",
             })
             continue
 
+        # Oldest format (arrow-style IV)
         m = sp_old_re.search(line)
         if m:
             rows.append({
@@ -314,16 +433,20 @@ for line in lines:
                 "stock_pnl":    clean(m.group(4)),
                 "stk_chg_pct":  "",
                 "combined":     clean(m.group(5)),
+                "sim_pnl":      "",
+                "iv_diff":      "",
                 "iv_entry":     m.group(6) + "%",
                 "iv_exit":      m.group(7) + "%",
                 "ivspread":     "",
                 "shiv_rv":      "",
                 "iv_change":    m.group(8) + "%",
                 "iv_rv":        m.group(9),
+                "non_earn_iv_rv": "",
                 "long_spread_entry":  "",
                 "short_spread_entry": "",
                 "long_spread_exit":   "",
                 "short_spread_exit":  "",
+                "call_spread_exit":   "",
             })
             continue
 
@@ -332,13 +455,33 @@ for line in lines:
 fields = [
     "ticker", "win", "earnings", "n_contracts",
     "long_pnl", "short_pnl", "put_pnl", "stock_pnl",
-    "stk_chg_pct", "combined",
+    "stk_chg_pct", "combined", "sim_pnl",
+    "iv_diff", "non_earn_iv_rv",
     "iv_entry", "iv_exit",
     "ivspread", "shiv_rv",
     "iv_change", "iv_rv",
     "long_spread_entry", "short_spread_entry",
     "long_spread_exit", "short_spread_exit",
+    "call_spread_exit",
+    "avg_sim_pnl",
 ]
+
+# Compute per-ticker avg SimPnL (rounded down to nearest dollar)
+ticker_sim = defaultdict(list)
+for r in rows:
+    v = r.get("sim_pnl", "")
+    if v:
+        try:
+            ticker_sim[r["ticker"]].append(float(v))
+        except ValueError:
+            pass
+ticker_avg = {}
+for t, vals in ticker_sim.items():
+    if vals:
+        import math
+        ticker_avg[t] = str(int(math.floor(sum(vals) / len(vals))))
+for r in rows:
+    r["avg_sim_pnl"] = ticker_avg.get(r["ticker"], "")
 
 with open(args.output, "w", encoding="utf-8") as f:
     f.write(",".join(fields) + "\n")
