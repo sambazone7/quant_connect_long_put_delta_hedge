@@ -4,8 +4,7 @@ from collections import defaultdict
 import time
 
 tickers = [
-"AAPL","GOOGL","GOOG","MSFT","NVDA","NFLX","MRVL","PLTR","AMZN","TSLA","PYPL","MSTR","AMD","PANW","LRCX","AVGO","INTC","META","WBD","TXN","DASH","SHOP","ZS","CMCSA","KHC","GILD","ADBE","DDOG","WMT","APP","MU","QCOM","CRWD","WDC","TMUS","CSCO","TEAM","ARM","MELI","CSX","PEP","HON","SBUX","COST","ROST","CEG","PDD","STX","WDAY","ADP","MDLZ","MAR","INTU","AMAT","FTNT","ABNB","MCHP","ADI","CDNS","TTWO","ISRG","ASML","CHTR","BKNG","ADSK","GEHC","AMGN","REGN","SNPS","DXCM","VRTX","CTAS","EA"
-]
+"RIG","CDE","OKLO","QBTS","APLD","LUMN","SATS","AVAV","PL","HL","KTOS","BE","IONQ","AAOI","UEC","DOCN","CRDO","CWAN",]
 
 start = datetime(2022, 1, 1)
 end   = datetime(2026, 2, 28)

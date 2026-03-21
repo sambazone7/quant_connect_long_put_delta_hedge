@@ -89,22 +89,24 @@ print(f"  Best:  {fmt(max(t['sim_pnl'] for t in trades))}   Worst: {fmt(min(t['s
 # ── 2. Top / Worst Trades ────────────────────────────────────────────────────
 
 print(f"\n{SEP}")
-print("  TOP 15 TRADES (by SimPnL)")
+print("  TOP 50 TRADES (by SimPnL)")
 print(SEP)
-for t in sorted(trades, key=lambda x: x["sim_pnl"], reverse=True)[:15]:
+for t in sorted(trades, key=lambda x: x["sim_pnl"], reverse=True)[:50]:
     extras = []
-    if t["iv_diff"] is not None: extras.append(f"IVdif={pct(t['iv_diff'])}")
+    if t["iv_diff"] is not None and t["iv_entry"] and t["iv_entry"] > 0:
+        extras.append(f"IVd/IV={t['iv_diff']/t['iv_entry']*100:.0f}%")
     if t["iv_entry"] is not None: extras.append(f"IVen={pct(t['iv_entry'])}")
     if t["iv_rv"] is not None: extras.append(f"IV/RV={t['iv_rv']:.2f}")
     if t["ne_iv_rv"] is not None: extras.append(f"neIVR={t['ne_iv_rv']:.2f}")
     print(f"  {t['ticker']:6s} {t['earnings']}  SimPnL={fmt(t['sim_pnl']):>10s}  StkChg={t['stk_chg']:+.1f}%  {' '.join(extras)}")
 
 print(f"\n{SEP}")
-print("  WORST 15 TRADES (by SimPnL)")
+print("  WORST 50 TRADES (by SimPnL)")
 print(SEP)
-for t in sorted(trades, key=lambda x: x["sim_pnl"])[:15]:
+for t in sorted(trades, key=lambda x: x["sim_pnl"])[:50]:
     extras = []
-    if t["iv_diff"] is not None: extras.append(f"IVdif={pct(t['iv_diff'])}")
+    if t["iv_diff"] is not None and t["iv_entry"] and t["iv_entry"] > 0:
+        extras.append(f"IVd/IV={t['iv_diff']/t['iv_entry']*100:.0f}%")
     if t["iv_entry"] is not None: extras.append(f"IVen={pct(t['iv_entry'])}")
     if t["iv_rv"] is not None: extras.append(f"IV/RV={t['iv_rv']:.2f}")
     if t["ne_iv_rv"] is not None: extras.append(f"neIVR={t['ne_iv_rv']:.2f}")
@@ -126,6 +128,25 @@ if iv_diff_trades:
     ]
     for label, fn in buckets:
         stats([t for t in iv_diff_trades if fn(t)], label)
+
+# ── 3b. IVdif / IV Entry Ratio ────────────────────────────────────────────────
+
+ratio_trades = [t for t in trades if t["iv_diff"] is not None and t["iv_entry"] is not None and t["iv_entry"] > 0]
+for t in ratio_trades:
+    t["ivdif_ratio"] = t["iv_diff"] / t["iv_entry"]
+if ratio_trades:
+    print(f"\n{SEP}")
+    print("  ANALYSIS: IVdif / IV_entry Ratio (lower = less term-structure premium)")
+    print(SEP)
+    buckets = [
+        ("Ratio < 0.05",     lambda t: t["ivdif_ratio"] < 0.05),
+        ("Ratio 0.05-0.10",  lambda t: 0.05 <= t["ivdif_ratio"] < 0.10),
+        ("Ratio 0.10-0.15",  lambda t: 0.10 <= t["ivdif_ratio"] < 0.15),
+        ("Ratio 0.15-0.20",  lambda t: 0.15 <= t["ivdif_ratio"] < 0.20),
+        ("Ratio >= 0.20",    lambda t: t["ivdif_ratio"] >= 0.20),
+    ]
+    for label, fn in buckets:
+        stats([t for t in ratio_trades if fn(t)], label)
 
 # ── 4. IV Entry Buckets ──────────────────────────────────────────────────────
 
