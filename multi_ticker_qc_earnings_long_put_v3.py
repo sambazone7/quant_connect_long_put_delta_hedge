@@ -16,10 +16,13 @@ M      = 5.0      # (DYNAMIC_ENTRY only — legacy, unused with new IV-ratio tri
 W      = 1.15     # (DYNAMIC_ENTRY only) enter when current_IV / 6-day-avg_IV >= W
                   # e.g. 1.15 → enter when IV has risen 15% above its baseline average
 S      = 10_000   # Notional USD value of puts to buy at entry (per ticker)
-D_mult  = 1.0    # Delta-tolerance scalar: tolerance = D_mult × daily_sigma_frac × |option_exposure|
-                  # e.g. 1.0 → tolerate up to 1 daily-sigma of delta drift before re-hedging
-RV_SIGMA = True   # True  → hedge tolerance sigma from live 30-day realized vol (refreshed daily)
-                  # False → hedge tolerance sigma from put IV at entry (fixed for life of trade)
+HEDGE_MODE = "gamma"  # "gamma" → PnL-tolerance trigger (ΔS = √(2·tol/Γ))
+                      # "sigma" → original vol-scaled delta tolerance
+PNL_TOLERANCE = 100   # (gamma mode) Dollar P&L threshold per position before re-hedging
+DRIFT_FLOOR   = 0.10  # (gamma mode) Max allowed |position_delta| as fraction of option exposure
+                      # Catches time-decay drift when stock is flat (0.10 = 10%)
+D_mult  = 1.0    # (sigma mode) tolerance = D_mult × daily_sigma_frac × |option_exposure|
+RV_SIGMA = True   # (sigma mode) True → live 30-day RV | False → entry IV
 F      = 0        # Minimum calendar days after earnings date for put expiry
 EXPIRE_SERIES = 0  # 0 → closest expiry after earnings (default)
                    # 1 → second closest weekly expiry after earnings
@@ -82,23 +85,27 @@ def _mid(bid, ask):
 
 class EarningsLongPutMultiTickerV2(QCAlgorithm):
     """
-    Multi-ticker Earnings Long-Put + Delta-Neutral Strategy  (V2 hedge)
+    Multi-ticker Earnings Long-Put + Delta-Neutral Strategy  (V3 hedge)
     ====================================================================
-    Identical to V1 except for the delta-hedge trigger logic:
+    Supports two hedge trigger modes (HEDGE_MODE config):
 
-    V1 (original):  re-hedge when stock % move from last hedge exceeds a
-                    vol-scaled band (price-move trigger).
-    V2 (this file): re-hedge when the net position delta (stock + options)
-                    exceeds a vol-scaled tolerance in share-equivalent terms
-                    (absolute-delta trigger).
+    "gamma"  — PnL-tolerance trigger based on option gamma.
+               Re-hedge when stock has moved enough that the gamma P&L
+               impact exceeds PNL_TOLERANCE dollars:
+                 ΔS_trigger = √(2 × PNL_TOLERANCE / total_gamma)
+               Plus a time-decay fallback: if |position_delta| exceeds
+               DRIFT_FLOOR × option_exposure, re-hedge regardless.
+               Adapts automatically: hedges more near ATM (high gamma),
+               less when deep OTM (low gamma).
 
-    Hedge decision each day (30 min before close):
+    "sigma"  — Original V2 vol-scaled delta tolerance.
+               Re-hedge when |position_delta| > D_mult × σ_daily × exposure.
+
+    Hedge decision each day (HEDGE_TIME_MIN before close):
       1. position_delta = stock_shares + (put_delta × contracts × 100)
-      2. daily_sigma_frac =
-           RV_SIGMA=True  → live 30-day realized vol / sqrt(252)
-           RV_SIGMA=False → entry IV / sqrt(252)
-      3. tolerance = D_mult × daily_sigma_frac × |option_exposure_in_shares|
-      4. If |position_delta| > tolerance → hedge to delta-neutral
+      2. Gamma mode: ΔS_trigger from live gamma + PNL_TOLERANCE
+         Sigma mode: tolerance from D_mult × daily_sigma × exposure
+      3. If trigger exceeded → hedge to delta-neutral
          Otherwise → do nothing.
     """
 
@@ -641,10 +648,12 @@ class EarningsLongPutMultiTickerV2(QCAlgorithm):
         # ── Step 1: Compute live position delta ──────────────────────────────
         # Find the current put Greeks from the live chain
         cur_delta = None
+        cur_gamma = None
         cur_iv    = 0.0
         for c in ts["chain"]:
             if c.Symbol == ts["put_symbol"]:
                 cur_delta = c.Greeks.Delta
+                cur_gamma = c.Greeks.Gamma
                 try:
                     cur_iv = c.ImpliedVolatility
                 except Exception:
@@ -676,28 +685,47 @@ class EarningsLongPutMultiTickerV2(QCAlgorithm):
         # Net position delta (should be near zero if well-hedged)
         position_delta = stock_delta + option_delta
 
-        # ── Step 2: Daily sigma fraction ─────────────────────────────────────
-        if RV_SIGMA:
-            # Use live 30-day realized vol (refreshed each hedge check)
-            rv = self._calc_realized_vol(ts["stock_symbol"], 30)
-            if rv <= 0:
-                return
-            daily_sigma_frac = rv / (252 ** 0.5)
-        else:
-            # Use the put's IV captured at entry (fixed for life of trade)
-            entry_iv = ts["put_entry_iv"]
-            if entry_iv <= 0:
-                return
-            daily_sigma_frac = entry_iv / (252 ** 0.5)
-
-        # ── Step 3: Tolerance (in shares) ────────────────────────────────────
-        # tolerance = D_mult × IV × sqrt(1/252) × |option_exposure_in_shares|
+        # ── Step 2: Hedge trigger ──────────────────────────────────────────────
         option_exposure = abs(ts["put_contracts"] * 100)
-        tolerance = D_mult * daily_sigma_frac * option_exposure
 
-        # ── Step 4: Hedge decision ───────────────────────────────────────────
-        if abs(position_delta) <= tolerance:
-            return   # within tolerance — do nothing
+        if HEDGE_MODE == "gamma":
+            # Gamma-based PnL trigger: ΔS_trigger = √(2 × PNL_TOLERANCE / Γ_pos)
+            total_gamma = abs(cur_gamma * ts["put_contracts"] * 100) if cur_gamma else 0.0
+
+            if total_gamma <= 1e-10:
+                # Gamma ≈ 0 → option is effectively dead (deep OTM near expiry).
+                # Fall through only if residual shares need unwinding.
+                if abs(position_delta) <= 1:
+                    return
+                # else: unwind leftover hedge shares below
+            else:
+                delta_s_trigger = (2.0 * PNL_TOLERANCE / total_gamma) ** 0.5
+                stock_move = abs(s_price - ts["last_hedge_price"])
+
+                # Time-decay fallback: re-hedge if delta drift exceeds floor
+                # even when the stock hasn't moved (charm / passage of time)
+                max_drift = DRIFT_FLOOR * option_exposure
+                if abs(position_delta) > max_drift:
+                    pass  # fall through to hedge
+                elif stock_move < delta_s_trigger:
+                    return  # within PnL tolerance — do nothing
+
+        else:
+            # Original sigma-based tolerance
+            if RV_SIGMA:
+                rv = self._calc_realized_vol(ts["stock_symbol"], 30)
+                if rv <= 0:
+                    return
+                daily_sigma_frac = rv / (252 ** 0.5)
+            else:
+                entry_iv = ts["put_entry_iv"]
+                if entry_iv <= 0:
+                    return
+                daily_sigma_frac = entry_iv / (252 ** 0.5)
+
+            tolerance = D_mult * daily_sigma_frac * option_exposure
+            if abs(position_delta) <= tolerance:
+                return  # within tolerance — do nothing
 
         # Re-hedge to delta-neutral: target stock qty offsets option delta
         target = max(0, round(abs(option_delta)))
