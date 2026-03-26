@@ -26,6 +26,7 @@ PRICE_MODEL = "default"  # "BT" | "BS" | "default"
 HOURLY_BARS = False       # True → Resolution.Hour; False → Resolution.Minute
 TRADE_TIME_MIN = 270      # Minutes after market open to enter/exit trades
 HEDGE_TIME_MIN = 15       # Minutes before market close to run delta hedge + IV sampling
+DEBUG = 1                 # 1 → log every delta-hedge decision with Greeks; 0 → silent
 
 # ─── Earnings Dates (universe definition) ────────────────────────────────────
 from listqqqAll import MANUAL_EARNINGS_DATES
@@ -330,17 +331,17 @@ class ShortPutIVRankAlgo(QCAlgorithm):
         if iv_rank < RANK_THRESHOLD:
             return
 
-        # ── Earnings guard (disabled) ──
-        # buffer_days = K + EARNINGS_BUFFER
-        # for ed in ts["earnings_dates"]:
-        #     days_away = (ed - today).days
-        #     if 0 <= days_away <= buffer_days:
-        #         return
-
         # ── Select put to sell (expiry ~K days out) ──────────────────
         put = self._select_put(ts["chain"], today, s_price, ticker)
         if put is None:
             return
+
+        # ── Earnings guard: never hold a put that expires after earnings ──
+        put_expiry = put.Expiry.date()
+        for ed in ts["earnings_dates"]:
+            if today <= ed <= put_expiry:
+                self.Log(f"  [{ticker}] SKIP — earnings {ed} before put expiry {put_expiry}")
+                return
 
         put_mid = _mid(put.BidPrice, put.AskPrice)
         if put_mid <= 0:
@@ -419,6 +420,10 @@ class ShortPutIVRankAlgo(QCAlgorithm):
             return
         if ts.get("force_exited"):
             return
+
+        if ts.get("put_symbol") is not None:
+            _res = Resolution.Hour if HOURLY_BARS else Resolution.Minute
+            self.AddOptionContract(ts["put_symbol"], _res)
 
         put_exit_iv = 0.0
         if ts["chain"]:
@@ -503,18 +508,24 @@ class ShortPutIVRankAlgo(QCAlgorithm):
         # ── Live position delta ───────────────────────────────────────
         cur_delta = None
         cur_iv    = 0.0
+        cur_gamma = 0.0
+        cur_theta = 0.0
         for c in ts["chain"]:
             if c.Symbol == ts["put_symbol"]:
                 cur_delta = c.Greeks.Delta
+                cur_gamma = c.Greeks.Gamma
+                cur_theta = c.Greeks.Theta
                 try:
                     cur_iv = c.ImpliedVolatility
                 except Exception:
                     cur_iv = 0.0
                 break
 
-        if cur_delta is None:
-            return
-        if cur_delta == 0.0 and cur_iv == 0.0:
+        if cur_delta is None or (cur_delta == 0.0 and cur_iv == 0.0):
+            strike = ts["put_symbol"].ID.StrikePrice
+            dist_pct = (s_price - strike) / strike * 100 if strike > 0 else 0
+            self.Log(f"  [{self.Time.date()}] [{ticker}] WARN delta unavailable — "
+                     f"stock ${s_price:.2f} vs strike ${strike:.2f} ({dist_pct:+.1f}%)")
             return
 
         # Track IV min/max over the life of the trade
@@ -550,13 +561,29 @@ class ShortPutIVRankAlgo(QCAlgorithm):
         tolerance = D_mult * daily_sigma_frac * option_exposure
 
         if abs(position_delta) <= tolerance:
+            if DEBUG:
+                strike = ts["put_symbol"].ID.StrikePrice
+                self.Log(f"  [{self.Time.date()}] [{ticker}] HEDGE SKIP "
+                         f"stk=${s_price:.2f} K=${strike:.0f} "
+                         f"delta={cur_delta:.4f} gamma={cur_gamma:.4f} "
+                         f"theta={cur_theta:.2f} IV={cur_iv:.1%} "
+                         f"posDelta={position_delta:.1f} tol={tolerance:.1f}")
             return
 
         # Target: stock qty should offset option delta → stock_target = -option_delta
-        target = -round(option_delta)
-        adj    = target - ts["stock_qty"]
+        target = int(-round(option_delta))
+        adj    = int(target - ts["stock_qty"])
         if adj == 0:
             return
+
+        if DEBUG:
+            strike = ts["put_symbol"].ID.StrikePrice
+            self.Log(f"  [{self.Time.date()}] [{ticker}] HEDGE adj={adj:+d} "
+                     f"stk=${s_price:.2f} K=${strike:.0f} "
+                     f"delta={cur_delta:.4f} gamma={cur_gamma:.4f} "
+                     f"theta={cur_theta:.2f} IV={cur_iv:.1%} "
+                     f"posDelta={position_delta:.1f} tol={tolerance:.1f} "
+                     f"stk_qty={ts['stock_qty']}→{target}")
 
         self._filling_ticker = ticker
         self.MarketOrder(ts["stock_symbol"], adj)
@@ -606,7 +633,7 @@ class ShortPutIVRankAlgo(QCAlgorithm):
         if candidate is None:
             return None
 
-        # Compare IV to prior-week expiry at the same strike
+        # Compare IV to prior-week expiry; roll back if IV spike detected
         try:
             cand_iv = candidate.ImpliedVolatility
         except Exception:
@@ -614,19 +641,26 @@ class ShortPutIVRankAlgo(QCAlgorithm):
 
         if cand_iv > 0 and IV_ROLLBACK_RATIO > 0:
             prior_target = best_expiry.date() - timedelta(days=7)
-            prior_candidates = [p for p in all_puts
-                                if p.Strike == candidate.Strike
-                                and p.Expiry.date() < best_expiry.date()]
-            if prior_candidates:
-                prior_put = min(prior_candidates,
-                                key=lambda p: abs((p.Expiry.date() - prior_target).days))
-                try:
-                    prior_iv = prior_put.ImpliedVolatility
-                except Exception:
-                    prior_iv = 0.0
+            prior_expiry_puts = [p for p in all_puts
+                                 if p.Expiry.date() < best_expiry.date()]
+            if prior_expiry_puts:
+                # Find the closest expiry to 1 week before the candidate
+                prior_expiry = min(set(p.Expiry for p in prior_expiry_puts),
+                                   key=lambda e: abs((e.date() - prior_target).days))
+                # Pick closest ATM/OTM strike at that expiry
+                prior_put = self._pick_atm(prior_expiry_puts, prior_expiry, stock_price)
+                if prior_put is not None:
+                    # Pin the prior-week contract so it stays available
+                    _res = Resolution.Hour if HOURLY_BARS else Resolution.Minute
+                    self.AddOptionContract(prior_put.Symbol, _res)
 
-                if prior_iv > 0 and cand_iv / prior_iv > IV_ROLLBACK_RATIO:
-                    return prior_put
+                    try:
+                        prior_iv = prior_put.ImpliedVolatility
+                    except Exception:
+                        prior_iv = 0.0
+
+                    if prior_iv > 0 and cand_iv / prior_iv > IV_ROLLBACK_RATIO:
+                        return prior_put
 
         return candidate
 
@@ -672,6 +706,12 @@ class ShortPutIVRankAlgo(QCAlgorithm):
             return
 
         self.Log(f"  [{self.Time.date()}] FINALIZING EMERGENCY EXIT for {ticker}")
+
+        n_contracts = ts["put_contracts"]
+        if n_contracts > 0 and ts.get("put_symbol") is not None:
+            self._filling_ticker = ticker
+            self.MarketOrder(ts["put_symbol"], n_contracts)
+            self._filling_ticker = None
 
         actual_stock_qty = 0
         if self.Portfolio.ContainsKey(ts["stock_symbol"]):

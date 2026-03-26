@@ -16,10 +16,15 @@ M      = 5.0      # (DYNAMIC_ENTRY only — legacy, unused with new IV-ratio tri
 W      = 1.15     # (DYNAMIC_ENTRY only) enter when current_IV / 6-day-avg_IV >= W
                   # e.g. 1.15 → enter when IV has risen 15% above its baseline average
 S      = 10_000   # Notional USD value of puts to buy at entry (per ticker)
-HEDGE_MODE = "gamma"  # "gamma" → PnL-tolerance trigger (ΔS = √(2·tol/Γ))
+HEDGE_MODE = "gamma"  # "gamma" → fixed PnL-tolerance trigger (ΔS = √(2·tol/Γ))
+                      # "theta" → theta-scaled PnL trigger (tol = THETA_K × |daily θ|)
                       # "sigma" → original vol-scaled delta tolerance
 PNL_TOLERANCE = 100   # (gamma mode) Dollar P&L threshold per position before re-hedging
-DRIFT_FLOOR   = 0.10  # (gamma mode) Max allowed |position_delta| as fraction of option exposure
+THETA_K       = 1.0   # (theta mode) Scalar on daily theta: tol = THETA_K × |θ_daily_position|
+                      # 1.0 = re-hedge at the theta-gamma breakeven move
+                      # <1  = tighter (hedge before breakeven)  >1 = looser
+MIN_TOLERANCE = 50    # (theta mode) Floor on dynamic tolerance to guard against near-zero theta
+DRIFT_FLOOR   = 0.10  # (gamma/theta mode) Max |position_delta| as fraction of option exposure
                       # Catches time-decay drift when stock is flat (0.10 = 10%)
 D_mult  = 1.0    # (sigma mode) tolerance = D_mult × daily_sigma_frac × |option_exposure|
 RV_SIGMA = True   # (sigma mode) True → live 30-day RV | False → entry IV
@@ -87,24 +92,29 @@ class EarningsLongPutMultiTickerV2(QCAlgorithm):
     """
     Multi-ticker Earnings Long-Put + Delta-Neutral Strategy  (V3 hedge)
     ====================================================================
-    Supports two hedge trigger modes (HEDGE_MODE config):
+    Supports three hedge trigger modes (HEDGE_MODE config):
 
-    "gamma"  — PnL-tolerance trigger based on option gamma.
-               Re-hedge when stock has moved enough that the gamma P&L
-               impact exceeds PNL_TOLERANCE dollars:
-                 ΔS_trigger = √(2 × PNL_TOLERANCE / total_gamma)
-               Plus a time-decay fallback: if |position_delta| exceeds
-               DRIFT_FLOOR × option_exposure, re-hedge regardless.
-               Adapts automatically: hedges more near ATM (high gamma),
-               less when deep OTM (low gamma).
+    "gamma"  — Fixed PnL-tolerance trigger based on option gamma.
+               ΔS_trigger = √(2 × PNL_TOLERANCE / Γ_position)
+               Re-hedge when stock move since last hedge exceeds ΔS_trigger.
+               Adapts to moneyness: hedges more near ATM, less when OTM.
+
+    "theta"  — Theta-scaled PnL trigger (theta-gamma breakeven).
+               Same ΔS formula but PNL_TOLERANCE = THETA_K × |daily_θ|.
+               Adapts to both moneyness AND option lifecycle: tighter
+               when theta is cheap (far from expiry), wider when theta
+               is expensive (near expiry). THETA_K=1.0 = breakeven move.
 
     "sigma"  — Original V2 vol-scaled delta tolerance.
                Re-hedge when |position_delta| > D_mult × σ_daily × exposure.
 
+    Both gamma and theta modes include a DRIFT_FLOOR fallback that
+    catches time-decay-driven delta drift when the stock is flat.
+
     Hedge decision each day (HEDGE_TIME_MIN before close):
       1. position_delta = stock_shares + (put_delta × contracts × 100)
-      2. Gamma mode: ΔS_trigger from live gamma + PNL_TOLERANCE
-         Sigma mode: tolerance from D_mult × daily_sigma × exposure
+      2. Gamma/theta: ΔS_trigger from live gamma + tolerance
+         Sigma: tolerance from D_mult × daily_sigma × exposure
       3. If trigger exceeded → hedge to delta-neutral
          Otherwise → do nothing.
     """
@@ -155,6 +165,7 @@ class EarningsLongPutMultiTickerV2(QCAlgorithm):
                 "stock_qty":       0,
                 "stock_cost_basis": 0.0,
                 "stock_realized":  0.0,
+                "hedge_count":     0,
                 "last_hedge_price": 0.0,
                 "entry_earnings":  None,
                 "entry_rv":        0.0,
@@ -599,7 +610,9 @@ class EarningsLongPutMultiTickerV2(QCAlgorithm):
             "put_spread_entry":   ts["put_spread_entry"],
             "put_spread_exit":    ts["put_spread_exit"],
             "call_spread_exit":   ts["call_spread_exit"],
+            "hedge_count":        ts["hedge_count"],
         })
+        ts["hedge_count"] = 0
         ts["traded_earnings"].add(ed)
         self._reset(ticker)
 
@@ -649,11 +662,13 @@ class EarningsLongPutMultiTickerV2(QCAlgorithm):
         # Find the current put Greeks from the live chain
         cur_delta = None
         cur_gamma = None
+        cur_theta = None
         cur_iv    = 0.0
         for c in ts["chain"]:
             if c.Symbol == ts["put_symbol"]:
                 cur_delta = c.Greeks.Delta
                 cur_gamma = c.Greeks.Gamma
+                cur_theta = c.Greeks.Theta
                 try:
                     cur_iv = c.ImpliedVolatility
                 except Exception:
@@ -688,8 +703,16 @@ class EarningsLongPutMultiTickerV2(QCAlgorithm):
         # ── Step 2: Hedge trigger ──────────────────────────────────────────────
         option_exposure = abs(ts["put_contracts"] * 100)
 
-        if HEDGE_MODE == "gamma":
-            # Gamma-based PnL trigger: ΔS_trigger = √(2 × PNL_TOLERANCE / Γ_pos)
+        if HEDGE_MODE in ("gamma", "theta"):
+            # Determine PnL tolerance: fixed (gamma) or theta-scaled (theta)
+            if HEDGE_MODE == "theta":
+                # QC Greeks.Theta is annualized; convert to per-day
+                daily_theta_pos = abs(cur_theta * ts["put_contracts"] * 100) / 365.0 if cur_theta else 0.0
+                pnl_tol = max(THETA_K * daily_theta_pos, MIN_TOLERANCE)
+            else:
+                pnl_tol = PNL_TOLERANCE
+
+            # ΔS trigger = √(2 × pnl_tol / Γ_position)
             total_gamma = abs(cur_gamma * ts["put_contracts"] * 100) if cur_gamma else 0.0
 
             if total_gamma <= 1e-10:
@@ -699,7 +722,7 @@ class EarningsLongPutMultiTickerV2(QCAlgorithm):
                     return
                 # else: unwind leftover hedge shares below
             else:
-                delta_s_trigger = (2.0 * PNL_TOLERANCE / total_gamma) ** 0.5
+                delta_s_trigger = (2.0 * pnl_tol / total_gamma) ** 0.5
                 stock_move = abs(s_price - ts["last_hedge_price"])
 
                 # Time-decay fallback: re-hedge if delta drift exceeds floor
@@ -738,7 +761,8 @@ class EarningsLongPutMultiTickerV2(QCAlgorithm):
         self._filling_ticker = None
         # OnOrderEvent handles stock_qty, stock_cost_basis, stock_realized
 
-        ts["last_hedge_price"] = s_price   # kept for reference / logging
+        ts["hedge_count"] += 1
+        ts["last_hedge_price"] = s_price
 
     # ── Helpers ───────────────────────────────────────────────────────────────
 
@@ -864,7 +888,9 @@ class EarningsLongPutMultiTickerV2(QCAlgorithm):
             "put_spread_entry":   ts["put_spread_entry"],
             "put_spread_exit":    0,
             "call_spread_exit":   0,
+            "hedge_count":        ts["hedge_count"],
         })
+        ts["hedge_count"] = 0
         ts["traded_earnings"].add(ed)
         self._reset(ticker)
 
@@ -912,6 +938,7 @@ class EarningsLongPutMultiTickerV2(QCAlgorithm):
 
         grand_trades = 0
         grand_wins   = 0
+        grand_hedges = 0
 
         for ticker in self._ts:
             trade_log = self._ts[ticker]["trade_log"]
@@ -1000,14 +1027,18 @@ class EarningsLongPutMultiTickerV2(QCAlgorithm):
                 f"  ${totals['total']:>+10,.2f}"
                 f"  ${totals['sim']:>+10,.2f}"
             )
-            self._ol(lines, f"  Avg PnL/trade: ${avg:+,.2f}")
+            ticker_hedges = sum(t.get("hedge_count", 0) for t in valid)
+            avg_hedges = ticker_hedges / printed if printed > 0 else 0.0
+            self._ol(lines, f"  Avg PnL/trade: ${avg:+,.2f}  |  Hedges: {ticker_hedges} total, {avg_hedges:.1f} avg/trade")
             self._ol(lines, f"{'═'*72}")
-            grand_total += totals["total"]
+            grand_total  += totals["total"]
+            grand_hedges += ticker_hedges
 
         if len(self._ts) > 1:
             self._ol(lines, f"{'═'*72}")
             self._ol(lines, f"  ALL TICKERS COMBINED  |  {grand_trades} trade(s)  |  Wins: {grand_wins}/{grand_trades}  |  Max concurrent positions: {self._max_concurrent}")
-            self._ol(lines, f"  Combined PnL: ${grand_total:+,.2f}  |  Avg PnL/trade: ${grand_total / grand_trades:+,.2f}" if grand_trades else f"  Combined PnL: ${grand_total:+,.2f}")
+            avg_h = grand_hedges / grand_trades if grand_trades else 0.0
+            self._ol(lines, f"  Combined PnL: ${grand_total:+,.2f}  |  Avg PnL/trade: ${grand_total / grand_trades:+,.2f}  |  Hedges: {grand_hedges} total, {avg_h:.1f} avg/trade" if grand_trades else f"  Combined PnL: ${grand_total:+,.2f}")
             self._ol(lines, f"{'═'*72}")
 
         # ── Persist full log to ObjectStore (no 100 KB cap) ──────────────
