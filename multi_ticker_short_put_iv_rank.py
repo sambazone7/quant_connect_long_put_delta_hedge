@@ -324,28 +324,28 @@ class ShortPutIVRankAlgo(QCAlgorithm):
         return None
 
     def _sample_iv(self, ticker):
-        """Sample IV from _put_for_iv_rank and append to history."""
+        """Sample IV from _put_for_iv_rank and append to history.
+        Falls back to the previous day's IV if the chain lookup fails."""
         ts = self._ts[ticker]
         today = self.Time.date()
 
         if ts["last_iv_sample_date"] == today:
             return
-        if ts["chain"] is None:
-            return
 
-        stock = self.Securities[ts["stock_symbol"]]
-        s_price = stock.Price
-        if s_price <= 0:
-            return
+        iv = 0.0
+        if ts["chain"] is not None:
+            stock = self.Securities[ts["stock_symbol"]]
+            s_price = stock.Price
+            if s_price > 0:
+                p_iv = self._put_for_iv_rank(ts["chain"], today, s_price)
+                if p_iv is not None:
+                    try:
+                        iv = p_iv.ImpliedVolatility
+                    except Exception:
+                        iv = 0.0
 
-        p_iv = self._put_for_iv_rank(ts["chain"], today, s_price)
-        if p_iv is None:
-            return
-
-        try:
-            iv = p_iv.ImpliedVolatility
-        except Exception:
-            iv = 0.0
+        if iv <= 0 and ts["iv_history"]:
+            iv = ts["iv_history"][-1][1]
 
         if iv > 0:
             ts["iv_history"].append((today, iv))
@@ -409,14 +409,15 @@ class ShortPutIVRankAlgo(QCAlgorithm):
             return
 
         # Need current IV for rank — same contract as _sample_iv
+        current_iv = 0.0
         iv_put = self._put_for_iv_rank(ts["chain"], today, s_price)
-        if iv_put is None:
-            return
-
-        try:
-            current_iv = iv_put.ImpliedVolatility
-        except Exception:
-            current_iv = 0.0
+        if iv_put is not None:
+            try:
+                current_iv = iv_put.ImpliedVolatility
+            except Exception:
+                current_iv = 0.0
+        if current_iv <= 0 and ts["iv_history"]:
+            current_iv = ts["iv_history"][-1][1]
         if current_iv <= 0:
             return
 
