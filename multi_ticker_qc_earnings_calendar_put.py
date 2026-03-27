@@ -163,6 +163,50 @@ class EarningsCalendarPutMultiTicker(QCAlgorithm):
     # ── Order fill tracking ──────────────────────────────────────────────────
 
     def OnOrderEvent(self, orderEvent):
+        # ── Detect QC auto-liquidation at SUBMITTED time (split / delisting) ──
+        if orderEvent.Status == OrderStatus.Submitted:
+            symbol = orderEvent.Symbol
+            for ticker, ts in self._ts.items():
+                if ts["state"] != "ACTIVE" or ts.get("force_exited"):
+                    continue
+                is_our_put = (symbol == ts.get("put_symbol") or
+                              symbol == ts.get("short_put_symbol"))
+                if is_our_put and self._filling_ticker != ticker:
+                    order = self.Transactions.GetOrderById(orderEvent.OrderId)
+                    if order is not None and order.Type == OrderType.MarketOnClose:
+                        ts["force_exited"] = True
+                        self._log(f"  [{self.Time.date()}] SPLIT/DELISTING MOC submitted "
+                                  f"for {ticker} option — closing all legs immediately")
+                        self._filling_ticker = ticker
+                        # Close long put
+                        if ts.get("put_symbol") and symbol != ts.get("put_symbol"):
+                            try:
+                                lq = self.Portfolio[ts["put_symbol"]].Quantity \
+                                     if self.Portfolio.ContainsKey(ts["put_symbol"]) else 0
+                            except Exception:
+                                lq = 0
+                            if lq != 0:
+                                self.MarketOrder(ts["put_symbol"], -lq)
+                        # Close short put
+                        if ts.get("short_put_symbol") and symbol != ts.get("short_put_symbol"):
+                            try:
+                                sq = self.Portfolio[ts["short_put_symbol"]].Quantity \
+                                     if self.Portfolio.ContainsKey(ts["short_put_symbol"]) else 0
+                            except Exception:
+                                sq = 0
+                            if sq != 0:
+                                self.MarketOrder(ts["short_put_symbol"], -sq)
+                        # Close stock
+                        try:
+                            stk_qty = self.Portfolio[ts["stock_symbol"]].Quantity \
+                                      if self.Portfolio.ContainsKey(ts["stock_symbol"]) else 0
+                        except Exception:
+                            stk_qty = 0
+                        if stk_qty != 0:
+                            self.MarketOrder(ts["stock_symbol"], -stk_qty)
+                        self._filling_ticker = None
+            return
+
         if orderEvent.Status != OrderStatus.Filled:
             return
 
@@ -200,8 +244,11 @@ class EarningsCalendarPutMultiTicker(QCAlgorithm):
                         ts["pending_hedge_shares"] = 0
                 else:
                     ts["put_exit_fill"] = fill_price
+                    if ts.get("force_exited"):
+                        self._finalize_forced_exit(ticker)
+                        return
                     # Detect auto-liquidation: long put sold but NOT by our code
-                    if self._filling_ticker != ticker and not ts.get("force_exited"):
+                    if self._filling_ticker != ticker:
                         self._log(f"  [{self.Time.date()}] AUTO-LIQUIDATION detected: "
                                  f"long put {symbol} sold at ${fill_price:.2f} (likely stock split)")
                         self._immediate_close_all(ticker, "long put auto-liquidation")
@@ -215,8 +262,11 @@ class EarningsCalendarPutMultiTicker(QCAlgorithm):
                 else:
                     # We bought back the short put (exit) — likely ASSIGNMENT
                     ts["short_put_exit_fill"] = fill_price
+                    if ts.get("force_exited"):
+                        self._finalize_forced_exit(ticker)
+                        return
                     # Detect assignment / auto-liquidation of short put
-                    if self._filling_ticker != ticker and not ts.get("force_exited"):
+                    if self._filling_ticker != ticker:
                         self._log(f"  [{self.Time.date()}] ASSIGNMENT detected: "
                                  f"short put {symbol} bought at ${fill_price:.2f}")
                         self._immediate_close_all(ticker, "short put assignment")
@@ -708,10 +758,10 @@ class EarningsCalendarPutMultiTicker(QCAlgorithm):
                 return
             daily_sigma_frac = rv / (252 ** 0.5)
         else:
-            entry_iv = ts["put_entry_iv"]
-            if entry_iv <= 0:
+            sigma_iv = cur_iv if cur_iv > 0 else ts["put_entry_iv"]
+            if sigma_iv <= 0:
                 return
-            daily_sigma_frac = entry_iv / (252 ** 0.5)
+            daily_sigma_frac = sigma_iv / (252 ** 0.5)
 
         # ── Step 3: Tolerance (in shares) ────────────────────────────────────
         option_exposure = abs(n * 100)
@@ -861,6 +911,55 @@ class EarningsCalendarPutMultiTicker(QCAlgorithm):
             "short_iv_rv":        _short_iv / _rv if _rv > 0 else 0.0,
             "_assign_strike":     short_strike,   # used by FLAT orphan cleanup
         })
+        ts["traded_earnings"].add(ed)
+        self._reset(ticker)
+
+    # ── Forced-exit finalization (split: stock+other legs closed at Submitted, ──
+    # ── MOC fills arrive at 16:00 — finalize P&L when last fill arrives)      ──
+
+    def _finalize_forced_exit(self, ticker):
+        """Called from put Filled handler when force_exited is True.
+        All legs were closed at Submitted time; this just records the
+        MOC fill price and finalizes P&L."""
+        ts = self._ts[ticker]
+        n = ts["put_contracts"]
+        long_pnl  = (ts["put_exit_fill"] - ts["put_entry_fill"]) * n * 100
+        short_pnl = (ts["short_put_entry_fill"] - ts["short_put_exit_fill"]) * n * 100
+        stk_pnl   = ts["stock_realized"]
+        total     = long_pnl + short_pnl + stk_pnl
+
+        entry_px = ts["stock_entry_price"]
+        exit_px  = self.Securities[ts["stock_symbol"]].Price if entry_px > 0 else 0.0
+        stk_chg_pct = ((exit_px - entry_px) / entry_px * 100) if entry_px > 0 else 0.0
+
+        ed = ts["entry_earnings"].date() if ts["entry_earnings"] else self.Time.date()
+
+        _short_iv = ts["short_put_entry_iv"]
+        _long_iv  = ts["put_entry_iv"]
+        _rv       = ts["entry_rv"]
+
+        ts["trade_log"].append({
+            "earnings":           ed,
+            "n_contracts":        n,
+            "long_pnl":           long_pnl,
+            "short_pnl":          short_pnl,
+            "stk_pnl":            stk_pnl,
+            "stk_chg_pct":        stk_chg_pct,
+            "total":              total,
+            "iv_entry":           _long_iv,
+            "iv_exit":            0.0,
+            "rv":                 _rv,
+            "iv_spread_entry":    _long_iv - _short_iv,
+            "short_iv_entry":     _short_iv,
+            "short_iv_rv":        _short_iv / _rv if _rv > 0 else 0.0,
+            "long_spread_entry":  ts.get("long_spread_entry", 0),
+            "short_spread_entry": ts.get("short_spread_entry", 0),
+            "long_spread_exit":   0,
+            "short_spread_exit":  0,
+        })
+        self._log(f"  [{self.Time.date()}] FORCED EXIT FINALIZED: "
+                  f"{ticker} longPnL=${long_pnl:+,.0f} shortPnL=${short_pnl:+,.0f} "
+                  f"stkPnL=${stk_pnl:+,.0f} total=${total:+,.0f}")
         ts["traded_earnings"].add(ed)
         self._reset(ticker)
 

@@ -27,7 +27,7 @@ MIN_TOLERANCE = 50    # (theta mode) Floor on dynamic tolerance to guard against
 DRIFT_FLOOR   = 0.10  # (gamma/theta mode) Max |position_delta| as fraction of option exposure
                       # Catches time-decay drift when stock is flat (0.10 = 10%)
 D_mult  = 1.0    # (sigma mode) tolerance = D_mult × daily_sigma_frac × |option_exposure|
-RV_SIGMA = True   # (sigma mode) True → live 30-day RV | False → entry IV
+RV_SIGMA = True   # (sigma mode) True → live 30-day RV | False → put's live IV (fallback entry IV)
 F      = 0        # Minimum calendar days after earnings date for put expiry
 EXPIRE_SERIES = 0  # 0 → closest expiry after earnings (default)
                    # 1 → second closest weekly expiry after earnings
@@ -263,6 +263,27 @@ class EarningsLongPutMultiTickerV2(QCAlgorithm):
     # ── Order fill tracking ──────────────────────────────────────────────────
 
     def OnOrderEvent(self, orderEvent):
+        # ── Detect QC auto-liquidation at SUBMITTED time (split / delisting) ──
+        if orderEvent.Status == OrderStatus.Submitted:
+            symbol = orderEvent.Symbol
+            for ticker, ts in self._ts.items():
+                if ts["state"] != "ACTIVE" or ts.get("force_exited"):
+                    continue
+                if symbol == ts.get("put_symbol") and self._filling_ticker != ticker:
+                    order = self.Transactions.GetOrderById(orderEvent.OrderId)
+                    if order is not None and order.Type == OrderType.MarketOnClose:
+                        ts["force_exited"] = True
+                        self.Log(f"  [{self.Time.date()}] SPLIT/DELISTING MOC submitted "
+                                 f"for {ticker} put — closing stock immediately")
+                        actual_qty = 0
+                        if self.Portfolio.ContainsKey(ts["stock_symbol"]):
+                            actual_qty = self.Portfolio[ts["stock_symbol"]].Quantity
+                        if actual_qty != 0:
+                            self._filling_ticker = ticker
+                            self.MarketOrder(ts["stock_symbol"], -actual_qty)
+                            self._filling_ticker = None
+            return
+
         if orderEvent.Status != OrderStatus.Filled:
             return
 
@@ -287,8 +308,49 @@ class EarningsLongPutMultiTickerV2(QCAlgorithm):
                         ts["pending_hedge_shares"] = 0
                 else:
                     ts["put_exit_fill"] = fill_price
+                    if ts.get("force_exited"):
+                        # Stock already closed at Submitted time — finalize P&L
+                        n = ts["put_contracts"]
+                        put_pnl = (fill_price - ts["put_entry_fill"]) * n * 100
+                        stk_pnl = ts["stock_realized"]
+                        total   = put_pnl + stk_pnl
+                        entry_px = ts["stock_entry_price"]
+                        exit_px  = self.Securities[ts["stock_symbol"]].Price if entry_px > 0 else 0.0
+                        stk_chg_pct = ((exit_px - entry_px) / entry_px * 100) if entry_px > 0 else 0.0
+                        ed = ts["entry_earnings"].date() if ts["entry_earnings"] else self.Time.date()
+                        iv_min_date = ts.get("iv_min_date")
+                        iv_min_days = (ed - iv_min_date).days if iv_min_date else 0
+                        iv_max_date = ts.get("iv_max_date")
+                        iv_max_days = (ed - iv_max_date).days if iv_max_date else 0
+                        ts["trade_log"].append({
+                            "earnings":           ed,
+                            "put_pnl":            put_pnl,
+                            "stk_pnl":            stk_pnl,
+                            "stk_chg_pct":        stk_chg_pct,
+                            "total":              total,
+                            "iv_early_put":       ts["iv_early_put"],
+                            "iv_entry":           ts["put_entry_iv"],
+                            "iv_exit":            0.0,
+                            "rv":                 ts["entry_rv"],
+                            "iv_min":             ts.get("iv_min", 0.0) or 0.0,
+                            "iv_min_days_before": iv_min_days,
+                            "iv_max":             ts.get("iv_max", 0.0) or 0.0,
+                            "iv_max_days_before": iv_max_days,
+                            "sim_pnl":            0.0,
+                            "put_spread_entry":   ts["put_spread_entry"],
+                            "put_spread_exit":    0,
+                            "call_spread_exit":   0,
+                            "hedge_count":        ts["hedge_count"],
+                        })
+                        self.Log(f"  [{self.Time.date()}] FORCED EXIT FINALIZED: "
+                                 f"{ticker} put=${fill_price:.2f} "
+                                 f"putPnL=${put_pnl:+,.0f} stkPnL=${stk_pnl:+,.0f} "
+                                 f"total=${total:+,.0f}")
+                        ts["hedge_count"] = 0
+                        self._reset(ticker)
+                        return
                     # Detect auto-liquidation: put sold but NOT by our code
-                    if self._filling_ticker != ticker and not ts.get("force_exited"):
+                    if self._filling_ticker != ticker:
                         self.Log(f"  [{self.Time.date()}] AUTO-LIQUIDATION detected: "
                                  f"put {symbol} sold at ${fill_price:.2f} (likely stock split)")
                         self._emergency_exit(ticker, "stock split / auto-liquidation")
@@ -741,10 +803,10 @@ class EarningsLongPutMultiTickerV2(QCAlgorithm):
                     return
                 daily_sigma_frac = rv / (252 ** 0.5)
             else:
-                entry_iv = ts["put_entry_iv"]
-                if entry_iv <= 0:
+                sigma_iv = cur_iv if cur_iv > 0 else ts["put_entry_iv"]
+                if sigma_iv <= 0:
                     return
-                daily_sigma_frac = entry_iv / (252 ** 0.5)
+                daily_sigma_frac = sigma_iv / (252 ** 0.5)
 
             tolerance = D_mult * daily_sigma_frac * option_exposure
             if abs(position_delta) <= tolerance:

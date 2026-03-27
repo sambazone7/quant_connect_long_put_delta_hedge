@@ -27,7 +27,7 @@ DELTA_HEDGE = True   # True → delta-hedge with stock daily;  False → no stoc
 D_mult  = 1.0    # Delta-tolerance scalar: tolerance = D_mult × daily_sigma_frac × |option_exposure|
                   # e.g. 1.0 → tolerate up to 1 daily-sigma of delta drift before re-hedging
 RV_SIGMA = True   # True  → hedge tolerance sigma from live 30-day realized vol (refreshed daily)
-                  # False → hedge tolerance sigma from long put IV at entry (fixed for life of trade)
+                  # False → hedge tolerance sigma from long put's live IV (fallback: entry IV)
 Z      = 0.0      # IV/RV filter: skip entry if IV/RV >= Z  (0.0 = disabled)
 MAX_PUT_PCT = 0.15  # Sanity: skip entry if long_put_mid > stock_price × MAX_PUT_PCT
 PUT_LIMIT_MULT = 1.2  # Limit order for long put at long_mid × this (prevents bad fills)

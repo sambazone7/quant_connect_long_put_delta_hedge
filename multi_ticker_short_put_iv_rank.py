@@ -7,26 +7,28 @@ import math
 
 # ─── Configurable Parameters ──────────────────────────────────────────────────
 
-K               = 20     # Target days-to-expiry for the sold put (calendar days)
-RANK_THRESHOLD  = 50     # Minimum IV Rank (0-100) to trigger entry
-NDAYS_CLOSE     = 14     # Close position after this many calendar days
-EARNINGS_BUFFER = 10     # Skip entry if earnings within K + this many calendar days
+K               = 80     # Target days-to-expiry for the sold put (calendar days)
+RANK_THRESHOLD  = 1      # Minimum IV Rank (0-100) to trigger entry
+NDAYS_CLOSE     = 28     # Close after this many calendar days; also entry earnings window [today, today+NDAYS_CLOSE]
+EARNINGS_BUFFER = 10     # (Reserved) documented for future use — not applied in entry logic today
+SKIP_EARNINGS_GUARD = False  # True → skip the entry earnings check below
 IV_LOOKBACK     = 252    # Trading days of IV history for IV Rank min/max
-IV_EXPIRY_MIN   = 28     # Min calendar days to expiry for the ATM put used to sample IV
+IV_RANK_SMOOTH_N = 10    # Average the N lowest/highest IV samples for rank min/max (1 = raw min/max)
+IV_RANK_TARGET_DTE = 90  # IV rank: closest listed expiry with DTE >= this; OTM put (strike < spot), walk down
 DAYS_AFTER_EARNINGS = 5  # Skip options whose expiry is within this many days after an earnings date
 MIN_DTE_EXIT = 5         # Close position if put has <= this many trading days until expiry
-IV_ROLLBACK_RATIO = 1.05 # If selected put IV / prior-week put IV > this, sell the prior-week put instead
+IV_ROLLBACK_RATIO = 0    # If selected put IV / prior-week put IV > this, sell the prior-week put instead (0 = disabled)
 
 S      = 10_000          # Notional USD value of puts to sell at entry (per ticker)
 D_mult  = 1.0            # Delta-tolerance scalar: tolerance = D_mult × daily_sigma_frac × |option_exposure|
-RV_SIGMA = False         # True → hedge sigma from live 30-day realized vol; False → from put IV at entry
+RV_SIGMA = False         # True → hedge tolerance from 30d RV; False → from put's live IV (chain); fallback entry IV if IV missing
 MAX_PUT_PCT = 0.15       # Skip entry if put_mid > stock_price × MAX_PUT_PCT
 SPREAD_CUTOFF_PCT = 0.20 # Max bid-ask spread as fraction of option mid price (0 = disabled)
 PRICE_MODEL = "default"  # "BT" | "BS" | "default"
 HOURLY_BARS = False       # True → Resolution.Hour; False → Resolution.Minute
 TRADE_TIME_MIN = 270      # Minutes after market open to enter/exit trades
 HEDGE_TIME_MIN = 15       # Minutes before market close to run delta hedge + IV sampling
-DEBUG = 1                 # 1 → log every delta-hedge decision with Greeks; 0 → silent
+DEBUG = 0                 # 1 → log every delta-hedge decision with Greeks; 0 → silent
 
 # ─── Earnings Dates (universe definition) ────────────────────────────────────
 from listqqqAll import MANUAL_EARNINGS_DATES
@@ -46,9 +48,12 @@ class ShortPutIVRankAlgo(QCAlgorithm):
     Sells ATM puts when IV Rank is elevated, delta-hedges with short
     stock, and closes after NDAYS_CLOSE calendar days.
 
+    IV Rank uses an OTM put (strike < spot) at the earliest listed expiry
+    with calendar DTE >= IV_RANK_TARGET_DTE.
+
     Entry criteria:
       1. IV Rank (252-day lookback) >= RANK_THRESHOLD
-      2. No earnings within K + EARNINGS_BUFFER calendar days
+      2. Unless SKIP_EARNINGS_GUARD: skip entry if any earnings in [today, today+NDAYS_CLOSE] (calendar)
       3. Not already holding a short put on this ticker
       4. Passes spread and price sanity filters
 
@@ -72,7 +77,7 @@ class ShortPutIVRankAlgo(QCAlgorithm):
         self._max_concurrent = 0
         self._filling_ticker = None
 
-        _exp_max = K + 30
+        _exp_max = max(K, IV_RANK_TARGET_DTE) + 30
 
         for ticker in tickers:
             _res = Resolution.Hour if HOURLY_BARS else Resolution.Minute
@@ -174,6 +179,27 @@ class ShortPutIVRankAlgo(QCAlgorithm):
     # ── Order fill tracking ───────────────────────────────────────────────────
 
     def OnOrderEvent(self, orderEvent):
+        # ── Detect QC auto-liquidation at SUBMITTED time (split / delisting) ──
+        if orderEvent.Status == OrderStatus.Submitted:
+            symbol = orderEvent.Symbol
+            for ticker, ts in self._ts.items():
+                if ts["state"] != "ACTIVE" or ts.get("force_exited"):
+                    continue
+                if symbol == ts.get("put_symbol") and self._filling_ticker != ticker:
+                    order = self.Transactions.GetOrderById(orderEvent.OrderId)
+                    if order is not None and order.Type == OrderType.MarketOnClose:
+                        ts["force_exited"] = True
+                        self.Log(f"  [{self.Time.date()}] SPLIT/DELISTING MOC submitted "
+                                 f"for {ticker} put — closing stock immediately")
+                        actual_qty = 0
+                        if self.Portfolio.ContainsKey(ts["stock_symbol"]):
+                            actual_qty = self.Portfolio[ts["stock_symbol"]].Quantity
+                        if actual_qty != 0:
+                            self._filling_ticker = ticker
+                            self.MarketOrder(ts["stock_symbol"], -actual_qty)
+                            self._filling_ticker = None
+            return
+
         if orderEvent.Status != OrderStatus.Filled:
             return
 
@@ -193,7 +219,41 @@ class ShortPutIVRankAlgo(QCAlgorithm):
                 else:
                     # Bought to close
                     ts["put_exit_fill"] = fill_price
-                    if self._filling_ticker != ticker and not ts.get("force_exited"):
+                    if ts.get("force_exited"):
+                        # Stock already closed at Submitted time — finalize P&L
+                        n = ts["put_contracts"]
+                        put_pnl = (ts["put_entry_fill"] - fill_price) * n * 100
+                        stk_pnl = ts["stock_realized"]
+                        total   = put_pnl + stk_pnl
+                        held_days = (self.Time.date() - ts["entry_date"]).days if ts["entry_date"] else 0
+                        ts["trade_log"].append({
+                            "entry_date":       ts["entry_date"],
+                            "exit_date":        self.Time.date(),
+                            "held_days":        held_days,
+                            "put_pnl":          put_pnl,
+                            "put_price_entry":  ts["put_entry_fill"],
+                            "put_price_exit":   fill_price,
+                            "stk_pnl":          stk_pnl,
+                            "stk_chg_pct":      0.0,
+                            "total":            total,
+                            "iv_entry":         ts["put_entry_iv"],
+                            "iv_exit":          0.0,
+                            "iv_trade_min":     ts["iv_trade_min"] or 0.0,
+                            "iv_trade_max":     ts["iv_trade_max"] or 0.0,
+                            "iv_rank_entry":    ts["entry_iv_rank"],
+                            "rv":               ts["entry_rv"],
+                            "iv_hist_min":      ts["iv_hist_min"],
+                            "iv_hist_max":      ts["iv_hist_max"],
+                            "put_spread_entry": ts["put_spread_entry"],
+                            "put_spread_exit":  0,
+                        })
+                        self.Log(f"  [{self.Time.date()}] FORCED EXIT FINALIZED: "
+                                 f"{ticker} put=${fill_price:.2f} "
+                                 f"putPnL=${put_pnl:+,.0f} stkPnL=${stk_pnl:+,.0f} "
+                                 f"total=${total:+,.0f}")
+                        self._reset(ticker)
+                        return
+                    if self._filling_ticker != ticker:
                         self.Log(f"  [{self.Time.date()}] AUTO-LIQUIDATION detected: "
                                  f"put {symbol} bought at ${fill_price:.2f}")
                         self._emergency_exit(ticker, "auto-liquidation")
@@ -201,27 +261,70 @@ class ShortPutIVRankAlgo(QCAlgorithm):
 
             # ── Stock fill ────────────────────────────────────────────
             if symbol == ts["stock_symbol"]:
-                if fill_qty < 0:
-                    # Selling / shorting stock
-                    ts["stock_cost_basis"] += fill_qty * fill_price
-                    ts["stock_qty"]        += fill_qty
-                else:
-                    # Buying / covering stock
-                    bought = fill_qty
+                if fill_qty > 0:
+                    # Buying stock — may cover short, flip to long, or add to long
+                    remaining = fill_qty
                     if ts["stock_qty"] < 0:
-                        avg_cost = abs(ts["stock_cost_basis"] / ts["stock_qty"]) if ts["stock_qty"] != 0 else fill_price
-                        ts["stock_realized"]   += (avg_cost - fill_price) * bought
-                        ts["stock_cost_basis"] += avg_cost * bought
-                        ts["stock_qty"]        += bought
-                    else:
-                        ts["stock_cost_basis"] += fill_qty * fill_price
-                        ts["stock_qty"]        += fill_qty
+                        avg_short = abs(ts["stock_cost_basis"] / ts["stock_qty"])
+                        cover = min(remaining, abs(ts["stock_qty"]))
+                        ts["stock_realized"]   += (avg_short - fill_price) * cover
+                        ts["stock_cost_basis"] += avg_short * cover
+                        ts["stock_qty"]        += cover
+                        remaining -= cover
+                    if remaining > 0:
+                        if ts["stock_qty"] > 0:
+                            ts["stock_cost_basis"] += remaining * fill_price
+                        else:
+                            ts["stock_cost_basis"] = remaining * fill_price
+                        ts["stock_qty"] += remaining
+                elif fill_qty < 0:
+                    # Selling stock — may close long, flip to short, or add to short
+                    remaining = abs(fill_qty)
+                    if ts["stock_qty"] > 0:
+                        avg_long = ts["stock_cost_basis"] / ts["stock_qty"]
+                        close = min(remaining, ts["stock_qty"])
+                        ts["stock_realized"]   += (fill_price - avg_long) * close
+                        ts["stock_cost_basis"] -= avg_long * close
+                        ts["stock_qty"]        -= close
+                        remaining -= close
+                    if remaining > 0:
+                        if ts["stock_qty"] < 0:
+                            ts["stock_cost_basis"] -= remaining * fill_price
+                        else:
+                            ts["stock_cost_basis"] = -(remaining * fill_price)
+                        ts["stock_qty"] -= remaining
                 return
 
     # ── IV Sampling + IV Rank ─────────────────────────────────────────────────
 
+    def _put_for_iv_rank(self, chain, today, stock_price):
+        """Earliest expiry with DTE >= IV_RANK_TARGET_DTE; OTM puts only (strike < spot),
+        highest strike first, walk down until ImpliedVolatility > 0."""
+        if chain is None or stock_price <= 0:
+            return None
+        floor = today + timedelta(days=IV_RANK_TARGET_DTE)
+        eligible = [c for c in chain
+                    if c.Right == OptionRight.Put
+                    and c.Expiry.date() >= floor]
+        if not eligible:
+            return None
+        best_exp = min(c.Expiry for c in eligible)
+        otm = [c for c in eligible
+               if c.Expiry == best_exp and c.Strike < stock_price]
+        if not otm:
+            return None
+        for strike in sorted(set(c.Strike for c in otm), reverse=True):
+            p = next(c for c in otm if c.Strike == strike)
+            try:
+                iv = p.ImpliedVolatility
+            except Exception:
+                iv = 0.0
+            if iv > 0:
+                return p
+        return None
+
     def _sample_iv(self, ticker):
-        """Sample ATM put IV (expiry >= IV_EXPIRY_MIN days) and append to history."""
+        """Sample IV from _put_for_iv_rank and append to history."""
         ts = self._ts[ticker]
         today = self.Time.date()
 
@@ -235,19 +338,12 @@ class ShortPutIVRankAlgo(QCAlgorithm):
         if s_price <= 0:
             return
 
-        min_expiry = today + timedelta(days=IV_EXPIRY_MIN)
-        puts = [c for c in ts["chain"]
-                if c.Right == OptionRight.Put
-                and c.Expiry.date() >= min_expiry]
-        if not puts:
+        p_iv = self._put_for_iv_rank(ts["chain"], today, s_price)
+        if p_iv is None:
             return
 
-        closest_expiry = min(p.Expiry for p in puts)
-        at_expiry = [p for p in puts if p.Expiry == closest_expiry]
-        atm = min(at_expiry, key=lambda p: abs(p.Strike - s_price))
-
         try:
-            iv = atm.ImpliedVolatility
+            iv = p_iv.ImpliedVolatility
         except Exception:
             iv = 0.0
 
@@ -255,15 +351,21 @@ class ShortPutIVRankAlgo(QCAlgorithm):
             ts["iv_history"].append((today, iv))
             ts["last_iv_sample_date"] = today
 
-    def _compute_iv_rank(self, ticker, current_iv):
-        """Compute IV Rank from the stored history. Returns 0-100 or None if insufficient data."""
+    def _iv_rank_bounds(self, ticker):
+        """Return (smoothed_min, smoothed_max) from iv_history, or (None, None)."""
         ts = self._ts[ticker]
         if len(ts["iv_history"]) < IV_LOOKBACK:
-            return None
-        iv_min = min(iv for _, iv in ts["iv_history"])
-        iv_max = max(iv for _, iv in ts["iv_history"])
-        if iv_max <= iv_min:
-            return 0.0
+            return None, None
+        vals = sorted(iv for _, iv in ts["iv_history"])
+        n = min(IV_RANK_SMOOTH_N, len(vals) // 4)
+        n = max(n, 1)
+        return sum(vals[:n]) / n, sum(vals[-n:]) / n
+
+    def _compute_iv_rank(self, ticker, current_iv):
+        """Compute IV Rank from the stored history. Returns 0-100 or None if insufficient data."""
+        iv_min, iv_max = self._iv_rank_bounds(ticker)
+        if iv_min is None or iv_max <= iv_min:
+            return None if iv_min is None else 0.0
         return (current_iv - iv_min) / (iv_max - iv_min) * 100.0
 
     # ── Position management (TRADE_TIME_MIN after open) ───────────────────────
@@ -306,17 +408,10 @@ class ShortPutIVRankAlgo(QCAlgorithm):
         if s_price <= 0:
             return
 
-        # Need current IV for rank — get ATM put IV from chain
-        min_expiry_date = today + timedelta(days=IV_EXPIRY_MIN)
-        iv_puts = [c for c in ts["chain"]
-                   if c.Right == OptionRight.Put
-                   and c.Expiry.date() >= min_expiry_date]
-        if not iv_puts:
+        # Need current IV for rank — same contract as _sample_iv
+        iv_put = self._put_for_iv_rank(ts["chain"], today, s_price)
+        if iv_put is None:
             return
-
-        closest_exp = min(p.Expiry for p in iv_puts)
-        at_exp = [p for p in iv_puts if p.Expiry == closest_exp]
-        iv_put = min(at_exp, key=lambda p: abs(p.Strike - s_price))
 
         try:
             current_iv = iv_put.ImpliedVolatility
@@ -336,12 +431,16 @@ class ShortPutIVRankAlgo(QCAlgorithm):
         if put is None:
             return
 
-        # ── Earnings guard: never hold a put that expires after earnings ──
-        put_expiry = put.Expiry.date()
-        for ed in ts["earnings_dates"]:
-            if today <= ed <= put_expiry:
-                self.Log(f"  [{ticker}] SKIP — earnings {ed} before put expiry {put_expiry}")
-                return
+        # ── Earnings guard (entry only): do not open if earnings during planned NDAYS_CLOSE calendar hold ──
+        if not SKIP_EARNINGS_GUARD:
+            hold_end = today + timedelta(days=NDAYS_CLOSE)
+            for ed in ts["earnings_dates"]:
+                if today <= ed <= hold_end:
+                    self.Log(
+                        f"  [{ticker}] SKIP — earnings {ed} within hold window "
+                        f"(entry {today} .. {hold_end}, NDAYS_CLOSE={NDAYS_CLOSE})"
+                    )
+                    return
 
         put_mid = _mid(put.BidPrice, put.AskPrice)
         if put_mid <= 0:
@@ -394,9 +493,10 @@ class ShortPutIVRankAlgo(QCAlgorithm):
         ts["entry_rv"]          = rv
         ts["iv_trade_min"]      = entry_iv
         ts["iv_trade_max"]      = entry_iv
-        if ts["iv_history"]:
-            ts["iv_hist_min"] = min(iv for _, iv in ts["iv_history"])
-            ts["iv_hist_max"] = max(iv for _, iv in ts["iv_history"])
+        iv_lo, iv_hi = self._iv_rank_bounds(ticker)
+        if iv_lo is not None:
+            ts["iv_hist_min"] = iv_lo
+            ts["iv_hist_max"] = iv_hi
 
         # Lock subscription so the contract stays in the chain even if price drifts from strike
         _res = Resolution.Hour if HOURLY_BARS else Resolution.Minute
@@ -468,6 +568,8 @@ class ShortPutIVRankAlgo(QCAlgorithm):
             "exit_date":        self.Time.date(),
             "held_days":        held_days,
             "put_pnl":          put_pnl,
+            "put_price_entry":  ts["put_entry_fill"],
+            "put_price_exit":   ts["put_exit_fill"],
             "stk_pnl":          stk_pnl,
             "stk_chg_pct":      stk_chg_pct,
             "total":            total_pnl,
@@ -551,10 +653,10 @@ class ShortPutIVRankAlgo(QCAlgorithm):
                 return
             daily_sigma_frac = rv / (252 ** 0.5)
         else:
-            entry_iv = ts["put_entry_iv"]
-            if entry_iv <= 0:
+            sigma_iv = cur_iv if cur_iv > 0 else ts["put_entry_iv"]
+            if sigma_iv <= 0:
                 return
-            daily_sigma_frac = entry_iv / (252 ** 0.5)
+            daily_sigma_frac = sigma_iv / (252 ** 0.5)
 
         # ── Tolerance ─────────────────────────────────────────────────
         option_exposure = abs(ts["put_contracts"] * 100)
@@ -733,6 +835,8 @@ class ShortPutIVRankAlgo(QCAlgorithm):
             "exit_date":        self.Time.date(),
             "held_days":        held_days,
             "put_pnl":          put_pnl,
+            "put_price_entry":  ts["put_entry_fill"],
+            "put_price_exit":   ts["put_exit_fill"],
             "stk_pnl":          stk_pnl,
             "stk_chg_pct":      0.0,
             "total":            total,
@@ -815,9 +919,12 @@ class ShortPutIVRankAlgo(QCAlgorithm):
                 _hmin = t.get("iv_hist_min", 0.0)
                 _hmax = t.get("iv_hist_max", 0.0)
                 D = "$"
+                _pen = t.get("put_price_entry", 0.0)
+                _pex = t.get("put_price_exit", 0.0)
                 self._ol(lines,
                     f"  {tag} {t['entry_date']!s:<11} {t['exit_date']!s:<11} days={t['held_days']}"
                     f"  PutPnL={D}{t['put_pnl']:>+,.0f}"
+                    f"  PrEn={_pen:.2f} PrEx={_pex:.2f}"
                     f"  StkPnL={D}{t['stk_pnl']:>+,.0f}"
                     f"  Stk={chg:>+.1f}%"
                     f"  PnL={D}{t['total']:>+,.0f}"

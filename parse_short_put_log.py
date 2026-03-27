@@ -6,9 +6,10 @@ Usage:
     python parse_short_put_log.py <logfile.txt> <output.csv>
 
 Parses trade lines of the form:
-  [-] 2022-03-25  2022-04-14  days=20  PutPnL=$-3,842  StkPnL=$+2,397
-      Stk=-4.1%  PnL=$-1,445  IVR=22 IV/RV=0.78  IVen=24.9% IVex=23.4%
-      TrMin=23.9% TrMax=27.1%  HMin=18.7% HMax=40.5%  SpEn=102 SpEx=340
+  [-] 2022-03-25  2022-04-14  days=20  PutPnL=$-3,842  PrEn=5.20 PrEx=8.05
+      StkPnL=$+2,397  Stk=-4.1%  PnL=$-1,445  IVR=22 IV/RV=0.78
+      IVen=24.9% IVex=23.4%  TrMin=23.9% TrMax=27.1%  HMin=18.7% HMax=40.5%
+      SpEn=102 SpEx=340
 """
 import re, sys, argparse
 from collections import defaultdict
@@ -26,6 +27,8 @@ trade_re = re.compile(
     r'(\d{4}-\d{2}-\d{2})\s+'
     r'days=(\d+)\s+'
     r'PutPnL=\$([+-]?[\d,]+)\s+'
+    r'PrEn=(\d+\.?\d*)\s+'
+    r'PrEx=(\d+\.?\d*)\s+'
     r'StkPnL=\$([+-]?[\d,]+)\s+'
     r'Stk=([+-]?\d+\.?\d*)%\s+'
     r'PnL=\$([+-]?[\d,]+)\s+'
@@ -68,24 +71,27 @@ for line in lines:
             "exit_date":     m.group(3),
             "days":          m.group(4),
             "put_pnl":       clean(m.group(5)),
-            "stk_pnl":       clean(m.group(6)),
-            "stk_chg_pct":   m.group(7),
-            "total_pnl":     clean(m.group(8)),
-            "ivr":           m.group(9),
-            "iv_rv":         m.group(10),
-            "iv_entry":      m.group(11),
-            "iv_exit":       m.group(12),
-            "iv_trade_min":  m.group(13),
-            "iv_trade_max":  m.group(14),
-            "iv_hist_min":   m.group(15),
-            "iv_hist_max":   m.group(16),
-            "spread_entry":  m.group(17),
-            "spread_exit":   m.group(18),
+            "put_price_en":  m.group(6),
+            "put_price_ex":  m.group(7),
+            "stk_pnl":       clean(m.group(8)),
+            "stk_chg_pct":   m.group(9),
+            "total_pnl":     clean(m.group(10)),
+            "ivr":           m.group(11),
+            "iv_rv":         m.group(12),
+            "iv_entry":      m.group(13),
+            "iv_exit":       m.group(14),
+            "iv_trade_min":  m.group(15),
+            "iv_trade_max":  m.group(16),
+            "iv_hist_min":   m.group(17),
+            "iv_hist_max":   m.group(18),
+            "spread_entry":  m.group(19),
+            "spread_exit":   m.group(20),
         })
 
 fields = [
     "ticker", "win", "entry_date", "exit_date", "days",
-    "put_pnl", "stk_pnl", "stk_chg_pct", "total_pnl",
+    "put_pnl", "put_price_en", "put_price_ex",
+    "stk_pnl", "stk_chg_pct", "total_pnl",
     "ivr", "iv_rv", "iv_entry", "iv_exit",
     "iv_trade_min", "iv_trade_max", "iv_hist_min", "iv_hist_max",
     "spread_entry", "spread_exit",
