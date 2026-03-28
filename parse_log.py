@@ -100,7 +100,68 @@ cal_new_re = re.compile(
     r'(\d+\.?\d+)'                           # 14 iv_rv
 )
 
-# ── Single-put: FULL format (SimPnL + IVdif + neIVR + PSpEn/PSpEx/CSpEx) ──
+# ── Single-put: V4b format (pIVEn/pIVEx + IVR/IVRex/IVsEn/IVsEx/VIXen/VIXex, no MinD/MaxD) ──
+# Example: [-] 2022-10-25  $ -5,425.00  $ +3,408.58  +3.0%  $ -2,016.42  $ -2,016.42  6.3%  72  85  88  95  39.4%  40.3%  50.0%  79.4%  32.5  29.7  50.0%  79.4%  +59%  1.46  1.28  125  50  0
+sp_v4b_re = re.compile(
+    r'\[([+-])\]\s+'                          # 1  win/loss
+    r'(\d{4}-\d{2}-\d{2})\s+'                # 2  date
+    r'\$\s*([+-]?[\d,]+\.\d+)\s+'            # 3  put_pnl
+    r'\$\s*([+-]?[\d,]+\.\d+)\s+'            # 4  stock_pnl
+    r'([+-]?\d+\.?\d*)%\s+'                  # 5  stk_chg_pct
+    r'\$\s*([+-]?[\d,]+\.\d+)\s+'            # 6  combined
+    r'\$\s*([+-]?[\d,]+\.\d+)\s+'            # 7  sim_pnl
+    r'(?:([+-]?\d+\.?\d*)%|n/a)\s+'          # 8  iv_diff (can be n/a)
+    r'(?:([+-]?\d+)|n/a)\s+'                 # 9  pIVEn (int, can be n/a)
+    r'(?:([+-]?\d+)|n/a)\s+'                 # 10 pIVEx (int, can be n/a)
+    r'(?:([+-]?\d+)|n/a)\s+'                 # 11 ivr (int, can be negative or n/a)
+    r'(?:([+-]?\d+)|n/a)\s+'                 # 12 ivrex (int, can be negative or n/a)
+    r'(?:(\d+\.?\d*)%|n/a)\s+'               # 13 iv_enter_sample (can be n/a)
+    r'(?:(\d+\.?\d*)%|n/a)\s+'               # 14 iv_exit_sample (can be n/a)
+    r'(\d+\.?\d*)%\s+'                       # 15 iv_entry
+    r'(\d+\.?\d*)%\s+'                       # 16 iv_exit
+    r'(?:(\d+\.?\d*)|n/a)\s+'                # 17 vix_entry (can be n/a)
+    r'(?:(\d+\.?\d*)|n/a)\s+'                # 18 vix_exit (can be n/a)
+    r'(\d+\.?\d*)%\s+'                       # 19 iv_min
+    r'(\d+\.?\d*)%\s+'                       # 20 iv_max
+    r'([+-]\d+)%\s+'                         # 21 iv_change
+    r'(\d+\.?\d+)\s+'                        # 22 iv_rv
+    r'(?:(?:(\d+\.\d+)|n/a)\s+)?'            # 23 ne_iv_rv (optional, can be n/a)
+    r'(\d+)\s+'                              # 24 put_spread_entry
+    r'(\d+)\s+'                              # 25 put_spread_exit
+    r'(\d+)'                                 # 26 call_spread_exit
+)
+
+# ── Single-put: V4 format (IVR/IVRex/IVsEn/IVsEx/VIXen/VIXex, no MinD/MaxD, NO pIVEn/pIVEx) ──
+# Fallback for older V4 logs that lack IV percentile columns
+# Example: [-] 2022-10-25  $ -5,425.00  $ +3,408.58  +3.0%  $ -2,016.42  $ -2,016.42  6.3%  88  95  39.4%  40.3%  50.0%  79.4%  32.5  29.7  50.0%  79.4%  +59%  1.46  1.28  125  50  0
+sp_v4_re = re.compile(
+    r'\[([+-])\]\s+'                          # 1  win/loss
+    r'(\d{4}-\d{2}-\d{2})\s+'                # 2  date
+    r'\$\s*([+-]?[\d,]+\.\d+)\s+'            # 3  put_pnl
+    r'\$\s*([+-]?[\d,]+\.\d+)\s+'            # 4  stock_pnl
+    r'([+-]?\d+\.?\d*)%\s+'                  # 5  stk_chg_pct
+    r'\$\s*([+-]?[\d,]+\.\d+)\s+'            # 6  combined
+    r'\$\s*([+-]?[\d,]+\.\d+)\s+'            # 7  sim_pnl
+    r'(?:([+-]?\d+\.?\d*)%|n/a)\s+'          # 8  iv_diff (can be n/a)
+    r'(?:([+-]?\d+)|n/a)\s+'                 # 9  ivr (int, can be negative or n/a)
+    r'(?:([+-]?\d+)|n/a)\s+'                 # 10 ivrex (int, can be negative or n/a)
+    r'(?:(\d+\.?\d*)%|n/a)\s+'               # 11 iv_enter_sample (can be n/a)
+    r'(?:(\d+\.?\d*)%|n/a)\s+'               # 12 iv_exit_sample (can be n/a)
+    r'(\d+\.?\d*)%\s+'                       # 13 iv_entry
+    r'(\d+\.?\d*)%\s+'                       # 14 iv_exit
+    r'(?:(\d+\.?\d*)|n/a)\s+'                # 15 vix_entry (can be n/a)
+    r'(?:(\d+\.?\d*)|n/a)\s+'                # 16 vix_exit (can be n/a)
+    r'(\d+\.?\d*)%\s+'                       # 17 iv_min
+    r'(\d+\.?\d*)%\s+'                       # 18 iv_max
+    r'([+-]\d+)%\s+'                         # 19 iv_change
+    r'(\d+\.?\d+)\s+'                        # 20 iv_rv
+    r'(?:(?:(\d+\.\d+)|n/a)\s+)?'            # 21 ne_iv_rv (optional, can be n/a)
+    r'(\d+)\s+'                              # 22 put_spread_entry
+    r'(\d+)\s+'                              # 23 put_spread_exit
+    r'(\d+)'                                 # 24 call_spread_exit
+)
+
+# ── Single-put: FULL format (SimPnL + IVdif + neIVR + PSpEn/PSpEx/CSpEx, with MinD/MaxD) ──
 # Example: [+] 2022-04-28  $+27,439.00  $-25,403.34  -10.8%  $+2,035.66  $+2,070.16  4.0%  28.2%  69.6%  27.0%  27  69.6%  1  +147%  0.88  0.76  230  460  23
 sp_full_re = re.compile(
     r'\[([+-])\]\s+'                          # 1  win/loss
@@ -326,7 +387,89 @@ for line in lines:
 
     # --- Single-put formats ---
     if current_format in ("singleput", None):
-        # Try full format first (SimPnL + IVdif + neIVR + spreads)
+        # Try V4b format first (with pIVEn/pIVEx columns)
+        m = sp_v4b_re.search(line)
+        if m:
+            rows.append({
+                "ticker":       current_ticker,
+                "win":          "Win" if m.group(1) == "+" else "Loss",
+                "earnings":     m.group(2),
+                "n_contracts":  "",
+                "long_pnl":     "",
+                "short_pnl":    "",
+                "put_pnl":      clean(m.group(3)),
+                "stock_pnl":    clean(m.group(4)),
+                "stk_chg_pct":  m.group(5),
+                "combined":     clean(m.group(6)),
+                "sim_pnl":      clean(m.group(7)),
+                "iv_diff":      m.group(8) + "%" if m.group(8) else "",
+                "perc_iv_en":   m.group(9) or "",
+                "perc_iv_ex":   m.group(10) or "",
+                "ivr":          m.group(11) or "",
+                "ivrex":        m.group(12) or "",
+                "iv_enter_sample": m.group(13) + "%" if m.group(13) else "",
+                "iv_exit_sample":  m.group(14) + "%" if m.group(14) else "",
+                "iv_entry":     m.group(15) + "%",
+                "iv_exit":      m.group(16) + "%",
+                "vix_entry":    m.group(17) or "",
+                "vix_exit":     m.group(18) or "",
+                "iv_min":       m.group(19) + "%",
+                "iv_max":       m.group(20) + "%",
+                "ivspread":     "",
+                "shiv_rv":      "",
+                "iv_change":    m.group(21) + "%",
+                "iv_rv":        m.group(22),
+                "non_earn_iv_rv": m.group(23) or "",
+                "long_spread_entry":  m.group(24),
+                "short_spread_entry": "",
+                "long_spread_exit":   m.group(25),
+                "short_spread_exit":  "",
+                "call_spread_exit":   m.group(26),
+            })
+            continue
+
+        # Try V4 format (without pIVEn/pIVEx — older V4 logs)
+        m = sp_v4_re.search(line)
+        if m:
+            rows.append({
+                "ticker":       current_ticker,
+                "win":          "Win" if m.group(1) == "+" else "Loss",
+                "earnings":     m.group(2),
+                "n_contracts":  "",
+                "long_pnl":     "",
+                "short_pnl":    "",
+                "put_pnl":      clean(m.group(3)),
+                "stock_pnl":    clean(m.group(4)),
+                "stk_chg_pct":  m.group(5),
+                "combined":     clean(m.group(6)),
+                "sim_pnl":      clean(m.group(7)),
+                "iv_diff":      m.group(8) + "%" if m.group(8) else "",
+                "perc_iv_en":   "",
+                "perc_iv_ex":   "",
+                "ivr":          m.group(9) or "",
+                "ivrex":        m.group(10) or "",
+                "iv_enter_sample": m.group(11) + "%" if m.group(11) else "",
+                "iv_exit_sample":  m.group(12) + "%" if m.group(12) else "",
+                "iv_entry":     m.group(13) + "%",
+                "iv_exit":      m.group(14) + "%",
+                "vix_entry":    m.group(15) or "",
+                "vix_exit":     m.group(16) or "",
+                "iv_min":       m.group(17) + "%",
+                "iv_max":       m.group(18) + "%",
+                "ivspread":     "",
+                "shiv_rv":      "",
+                "iv_change":    m.group(19) + "%",
+                "iv_rv":        m.group(20),
+                "non_earn_iv_rv": m.group(21) or "",
+                "long_spread_entry":  m.group(22),
+                "short_spread_entry": "",
+                "long_spread_exit":   m.group(23),
+                "short_spread_exit":  "",
+                "call_spread_exit":   m.group(24),
+            })
+            continue
+
+        # Try older full format (SimPnL + IVdif + neIVR + spreads, with MinD/MaxD)
         m = sp_full_re.search(line)
         if m:
             rows.append({
@@ -456,8 +599,12 @@ fields = [
     "ticker", "win", "earnings", "n_contracts",
     "long_pnl", "short_pnl", "put_pnl", "stock_pnl",
     "stk_chg_pct", "combined", "sim_pnl",
-    "iv_diff", "non_earn_iv_rv",
+    "iv_diff", "perc_iv_en", "perc_iv_ex", "ivr", "ivrex",
+    "iv_enter_sample", "iv_exit_sample",
     "iv_entry", "iv_exit",
+    "vix_entry", "vix_exit",
+    "iv_min", "iv_max",
+    "non_earn_iv_rv",
     "ivspread", "shiv_rv",
     "iv_change", "iv_rv",
     "long_spread_entry", "short_spread_entry",

@@ -116,6 +116,7 @@ class ShortPutIVRankAlgo(QCAlgorithm):
                 "chain":            None,
                 "iv_history":       deque(maxlen=IV_LOOKBACK),
                 "last_iv_sample_date": None,
+                "iv_sample_fails":  0,
                 "earnings_dates":   earnings,
                 "trade_log":        [],
                 "force_exited":     False,
@@ -298,8 +299,9 @@ class ShortPutIVRankAlgo(QCAlgorithm):
     # ── IV Sampling + IV Rank ─────────────────────────────────────────────────
 
     def _put_for_iv_rank(self, chain, today, stock_price):
-        """Earliest expiry with DTE >= IV_RANK_TARGET_DTE; OTM puts only (strike < spot),
-        highest strike first, walk down until ImpliedVolatility > 0."""
+        """Earliest expiry with DTE >= IV_RANK_TARGET_DTE; OTM/ATM puts (strike <= spot),
+        highest strike first, walk down until ImpliedVolatility > 0.
+        Tries up to 2 expiry dates before giving up."""
         if chain is None or stock_price <= 0:
             return None
         floor = today + timedelta(days=IV_RANK_TARGET_DTE)
@@ -308,19 +310,20 @@ class ShortPutIVRankAlgo(QCAlgorithm):
                     and c.Expiry.date() >= floor]
         if not eligible:
             return None
-        best_exp = min(c.Expiry for c in eligible)
-        otm = [c for c in eligible
-               if c.Expiry == best_exp and c.Strike < stock_price]
-        if not otm:
-            return None
-        for strike in sorted(set(c.Strike for c in otm), reverse=True):
-            p = next(c for c in otm if c.Strike == strike)
-            try:
-                iv = p.ImpliedVolatility
-            except Exception:
-                iv = 0.0
-            if iv > 0:
-                return p
+        expiries = sorted(set(c.Expiry for c in eligible))[:2]
+        for exp in expiries:
+            otm = [c for c in eligible
+                   if c.Expiry == exp and c.Strike <= stock_price]
+            if not otm:
+                continue
+            for strike in sorted(set(c.Strike for c in otm), reverse=True):
+                p = next(c for c in otm if c.Strike == strike)
+                try:
+                    iv = p.ImpliedVolatility
+                except Exception:
+                    iv = 0.0
+                if iv > 0:
+                    return p
         return None
 
     def _sample_iv(self, ticker):
@@ -344,8 +347,10 @@ class ShortPutIVRankAlgo(QCAlgorithm):
                     except Exception:
                         iv = 0.0
 
-        if iv <= 0 and ts["iv_history"]:
-            iv = ts["iv_history"][-1][1]
+        if iv <= 0:
+            ts["iv_sample_fails"] += 1
+            if ts["iv_history"]:
+                iv = ts["iv_history"][-1][1]
 
         if iv > 0:
             ts["iv_history"].append((today, iv))
@@ -960,7 +965,9 @@ class ShortPutIVRankAlgo(QCAlgorithm):
                 f"  ALL TICKERS COMBINED  |  {grand_trades} trade(s)  |  "
                 f"Wins: {grand_wins}/{grand_trades} ({wp:.1f}%)  |  "
                 f"Max concurrent: {self._max_concurrent}")
+            grand_iv_fails = sum(ts["iv_sample_fails"] for ts in self._ts.values())
             self._ol(lines, f"  Combined PnL: ${grand_total:+,.2f}  |  Avg PnL/trade: ${avg_all:+,.2f}")
+            self._ol(lines, f"  IV sample fails: {grand_iv_fails}")
             self._ol(lines, f"{'=' * 90}")
 
         self.ObjectStore.Save("backtest_logs", "\n".join(lines))

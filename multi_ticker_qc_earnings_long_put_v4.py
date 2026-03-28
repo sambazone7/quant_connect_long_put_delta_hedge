@@ -1,5 +1,6 @@
 # region imports
 from AlgorithmImports import *
+from QuantConnect.DataSource import *
 from datetime import timedelta, date as Date
 from collections import deque
 import requests
@@ -50,7 +51,7 @@ HEDGE_TIME_MIN = 15       # Minutes before market close to run delta hedge
                           # 15 → 3:45 PM ET,  30 → 3:30 PM ET
 IV_LOOKBACK        = 126  # Trading days of IV history for IV Rank min/max
 IV_RANK_SMOOTH_N   = 10   # Average the N lowest/highest IV samples for rank min/max
-IV_RANK_TARGET_DTE = 90   # IV rank sampling: closest expiry with DTE >= this; OTM put (strike < spot)
+IV_RANK_TARGET_DTE = 50   # IV rank sampling: closest expiry with DTE >= this; OTM put (strike < spot)
 
 # ─── Financial Modeling Prep API ──────────────────────────────────────────────
 FMP_API_KEY = ""   # Leave empty to rely solely on MANUAL_EARNINGS_DATES below
@@ -132,6 +133,8 @@ class EarningsLongPutMultiTickerV2(QCAlgorithm):
 
         self.SetWarmUp(timedelta(days=IV_LOOKBACK + 60))
 
+        self._vix_symbol = self.AddData(CBOE, "VIX", Resolution.Daily).Symbol
+
         tickers = list(MANUAL_EARNINGS_DATES.keys())
 
         # Per-ticker state dict
@@ -198,8 +201,16 @@ class EarningsLongPutMultiTickerV2(QCAlgorithm):
                 # IV rank state
                 "iv_history":          deque(maxlen=IV_LOOKBACK),
                 "last_iv_sample_date": None,
+                "iv_sample_fails":        0,
+                "iv_sample_fails_warmup": 0,
                 "entry_iv_rank":       None,
                 "exit_iv_rank":        None,
+                "iv_enter_sample":     None,
+                "iv_exit_sample":      None,
+                "entry_iv_pctl":       None,
+                "exit_iv_pctl":        None,
+                "vix_entry":           None,
+                "vix_exit":            None,
             }
 
             # Scheduled events — capture ticker in default arg
@@ -354,6 +365,12 @@ class EarningsLongPutMultiTickerV2(QCAlgorithm):
                             "hedge_count":        ts["hedge_count"],
                             "iv_rank":            ts["entry_iv_rank"],
                             "iv_rank_exit":       ts["exit_iv_rank"],
+                            "iv_enter_sample":    ts["iv_enter_sample"],
+                            "iv_exit_sample":     ts["iv_exit_sample"],
+                            "entry_iv_pctl":      ts["entry_iv_pctl"],
+                            "exit_iv_pctl":       ts["exit_iv_pctl"],
+                            "vix_entry":          ts["vix_entry"],
+                            "vix_exit":           ts["vix_exit"],
                         })
                         self.Log(f"  [{self.Time.date()}] FORCED EXIT FINALIZED: "
                                  f"{ticker} put=${fill_price:.2f} "
@@ -542,6 +559,8 @@ class EarningsLongPutMultiTickerV2(QCAlgorithm):
             rank_iv = ts["iv_history"][-1][1]
         if rank_iv > 0:
             ts["entry_iv_rank"] = self._compute_iv_rank(ticker, rank_iv)
+            ts["iv_enter_sample"] = rank_iv
+            ts["entry_iv_pctl"] = self._compute_iv_percentile(ticker, rank_iv)
 
         if Z > 0 and rv > 0:
             if cur_iv / rv >= Z:
@@ -596,6 +615,9 @@ class EarningsLongPutMultiTickerV2(QCAlgorithm):
         if active > self._max_concurrent:
             self._max_concurrent = active
 
+        vix_px = self.Securities[self._vix_symbol].Price
+        ts["vix_entry"] = vix_px if vix_px > 0 else None
+
     # ── Exit ──────────────────────────────────────────────────────────────────
 
     def _exit_position(self, ticker):
@@ -604,6 +626,9 @@ class EarningsLongPutMultiTickerV2(QCAlgorithm):
             return
         if ts.get("force_exited"):
             return   # already emergency-closed (e.g. stock split)
+
+        vix_px = self.Securities[self._vix_symbol].Price
+        ts["vix_exit"] = vix_px if vix_px > 0 else None
 
         # Read exit IV from chain (for logging + min/max tracking)
         put_exit_iv = 0.0
@@ -639,6 +664,8 @@ class EarningsLongPutMultiTickerV2(QCAlgorithm):
             exit_rank_iv = ts["iv_history"][-1][1]
         if exit_rank_iv > 0:
             ts["exit_iv_rank"] = self._compute_iv_rank(ticker, exit_rank_iv)
+            ts["iv_exit_sample"] = exit_rank_iv
+            ts["exit_iv_pctl"] = self._compute_iv_percentile(ticker, exit_rank_iv)
 
         # Save quantities before orders (OnOrderEvent will zero them out)
         n_contracts = ts["put_contracts"]
@@ -717,6 +744,12 @@ class EarningsLongPutMultiTickerV2(QCAlgorithm):
             "hedge_count":        ts["hedge_count"],
             "iv_rank":            ts["entry_iv_rank"],
             "iv_rank_exit":       ts["exit_iv_rank"],
+            "iv_enter_sample":    ts["iv_enter_sample"],
+            "iv_exit_sample":     ts["iv_exit_sample"],
+            "entry_iv_pctl":      ts["entry_iv_pctl"],
+            "exit_iv_pctl":       ts["exit_iv_pctl"],
+            "vix_entry":          ts["vix_entry"],
+            "vix_exit":           ts["vix_exit"],
         })
         ts["hedge_count"] = 0
         ts["traded_earnings"].add(ed)
@@ -875,8 +908,9 @@ class EarningsLongPutMultiTickerV2(QCAlgorithm):
     # ── IV Sampling + IV Rank ─────────────────────────────────────────────────
 
     def _put_for_iv_rank(self, chain, today, stock_price):
-        """Earliest expiry with DTE >= IV_RANK_TARGET_DTE; OTM puts only (strike < spot),
-        highest strike first, walk down until ImpliedVolatility > 0."""
+        """Earliest expiry with DTE >= IV_RANK_TARGET_DTE; OTM/ATM puts (strike <= spot),
+        highest strike first, walk down until ImpliedVolatility > 0.
+        Tries up to 2 expiry dates before giving up."""
         if chain is None or stock_price <= 0:
             return None
         floor = today + timedelta(days=IV_RANK_TARGET_DTE)
@@ -885,19 +919,20 @@ class EarningsLongPutMultiTickerV2(QCAlgorithm):
                     and c.Expiry.date() >= floor]
         if not eligible:
             return None
-        best_exp = min(c.Expiry for c in eligible)
-        otm = [c for c in eligible
-               if c.Expiry == best_exp and c.Strike < stock_price]
-        if not otm:
-            return None
-        for strike in sorted(set(c.Strike for c in otm), reverse=True):
-            p = next(c for c in otm if c.Strike == strike)
-            try:
-                iv = p.ImpliedVolatility
-            except Exception:
-                iv = 0.0
-            if iv > 0:
-                return p
+        expiries = sorted(set(c.Expiry for c in eligible))[:2]
+        for exp in expiries:
+            otm = [c for c in eligible
+                   if c.Expiry == exp and c.Strike <= stock_price]
+            if not otm:
+                continue
+            for strike in sorted(set(c.Strike for c in otm), reverse=True):
+                p = next(c for c in otm if c.Strike == strike)
+                try:
+                    iv = p.ImpliedVolatility
+                except Exception:
+                    iv = 0.0
+                if iv > 0:
+                    return p
         return None
 
     def _sample_iv(self, ticker):
@@ -921,8 +956,13 @@ class EarningsLongPutMultiTickerV2(QCAlgorithm):
                     except Exception:
                         iv = 0.0
 
-        if iv <= 0 and ts["iv_history"]:
-            iv = ts["iv_history"][-1][1]
+        if iv <= 0:
+            if self.IsWarmingUp:
+                ts["iv_sample_fails_warmup"] += 1
+            else:
+                ts["iv_sample_fails"] += 1
+            if ts["iv_history"]:
+                iv = ts["iv_history"][-1][1]
 
         if iv > 0:
             ts["iv_history"].append((today, iv))
@@ -944,6 +984,14 @@ class EarningsLongPutMultiTickerV2(QCAlgorithm):
         if iv_min is None or iv_max <= iv_min:
             return None if iv_min is None else 0.0
         return (current_iv - iv_min) / (iv_max - iv_min) * 100.0
+
+    def _compute_iv_percentile(self, ticker, current_iv):
+        """IV Percentile: % of days in iv_history where IV was below current_iv."""
+        ts = self._ts[ticker]
+        if len(ts["iv_history"]) < IV_LOOKBACK:
+            return None
+        below = sum(1 for _, iv in ts["iv_history"] if iv < current_iv)
+        return below / len(ts["iv_history"]) * 100.0
 
     # ── Helpers ───────────────────────────────────────────────────────────────
 
@@ -1072,6 +1120,12 @@ class EarningsLongPutMultiTickerV2(QCAlgorithm):
             "hedge_count":        ts["hedge_count"],
             "iv_rank":            ts["entry_iv_rank"],
             "iv_rank_exit":       ts["exit_iv_rank"],
+            "iv_enter_sample":    ts["iv_enter_sample"],
+            "iv_exit_sample":     ts["iv_exit_sample"],
+            "entry_iv_pctl":      ts["entry_iv_pctl"],
+            "exit_iv_pctl":       ts["exit_iv_pctl"],
+            "vix_entry":          ts["vix_entry"],
+            "vix_exit":           ts["vix_exit"],
         })
         ts["hedge_count"] = 0
         ts["traded_earnings"].add(ed)
@@ -1109,6 +1163,12 @@ class EarningsLongPutMultiTickerV2(QCAlgorithm):
         ts["call_spread_exit"] = 0
         ts["entry_iv_rank"]    = None
         ts["exit_iv_rank"]     = None
+        ts["iv_enter_sample"]  = None
+        ts["iv_exit_sample"]   = None
+        ts["entry_iv_pctl"]    = None
+        ts["exit_iv_pctl"]     = None
+        ts["vix_entry"]        = None
+        ts["vix_exit"]         = None
 
     # ── End-of-backtest summary ───────────────────────────────────────────────
 
@@ -1149,8 +1209,10 @@ class EarningsLongPutMultiTickerV2(QCAlgorithm):
                 f" {'Put PnL':>12} {'Stock PnL':>12} {'Stk Chg%':>9} {'Combined':>12}"
                 f" {'SimPnL':>12}"
                 f" {'IVdif':>7}"
+                f" {'pIVEn':>6} {'pIVEx':>6}"
                 f" {'IVR':>5} {'IVRex':>6}"
-                f" {'IV entry':>9} {'IV exit':>8} {'IV min':>7} {'MinD':>5} {'IV max':>7} {'MaxD':>5}"
+                f" {'IVsEn':>7} {'IVsEx':>7}"
+                f" {'IV entry':>9} {'IV exit':>8} {'VIXen':>6} {'VIXex':>6} {'IV min':>7} {'IV max':>7}"
                 f" {'IV chg':>7} {'IV/RV':>6} {'neIVR':>6}"
                 f" {'PSpEn':>7} {'PSpEx':>7} {'CSpEx':>7}"
             )
@@ -1167,9 +1229,7 @@ class EarningsLongPutMultiTickerV2(QCAlgorithm):
                 iv_chg = (t['iv_exit'] - t['iv_entry']) / t['iv_entry'] * 100 if t['iv_entry'] > 0 else 0.0
                 chg    = t.get("stk_chg_pct", 0.0)
                 iv_min = t.get("iv_min", 0.0)
-                mind   = t.get("iv_min_days_before", 0)
                 iv_max = t.get("iv_max", 0.0)
-                maxd   = t.get("iv_max_days_before", 0)
                 _sim   = t.get("sim_pnl", 0.0)
                 _eiv     = t.get("iv_early_put", 0.0)
                 _ivdif   = f"{(t['iv_entry'] - _eiv)*100:>5.1f}%" if _eiv > 0 else "    n/a"
@@ -1177,10 +1237,22 @@ class EarningsLongPutMultiTickerV2(QCAlgorithm):
                 _pse   = t.get("put_spread_entry", 0)
                 _psx   = t.get("put_spread_exit", 0)
                 _csx   = t.get("call_spread_exit", 0)
+                _pivEn = t.get("entry_iv_pctl")
+                _pivEx = t.get("exit_iv_pctl")
+                _pivEn_s = f"{_pivEn:.0f}" if _pivEn is not None else "n/a"
+                _pivEx_s = f"{_pivEx:.0f}" if _pivEx is not None else "n/a"
                 _ivr   = t.get("iv_rank")
                 _ivrex = t.get("iv_rank_exit")
                 _ivr_s   = f"{_ivr:.0f}" if _ivr is not None else "n/a"
                 _ivrex_s = f"{_ivrex:.0f}" if _ivrex is not None else "n/a"
+                _ives  = t.get("iv_enter_sample")
+                _ivxs  = t.get("iv_exit_sample")
+                _ives_s = f"{_ives:.1%}" if _ives is not None else "  n/a"
+                _ivxs_s = f"{_ivxs:.1%}" if _ivxs is not None else "  n/a"
+                _vixen = t.get("vix_entry")
+                _vixxs = t.get("vix_exit")
+                _vixen_s = f"{_vixen:.1f}" if _vixen else "n/a"
+                _vixxs_s = f"{_vixxs:.1f}" if _vixxs else "n/a"
                 self._ol(lines,
                     f"  {tag} {t['earnings']!s:<11}"
                     f"  ${t['put_pnl']:>+10,.2f}"
@@ -1189,13 +1261,14 @@ class EarningsLongPutMultiTickerV2(QCAlgorithm):
                     f"  ${t['total']:>+10,.2f}"
                     f"  ${_sim:>+10,.2f}"
                     f"  {_ivdif:>7}"
+                    f"  {_pivEn_s:>6} {_pivEx_s:>6}"
                     f"  {_ivr_s:>5} {_ivrex_s:>6}"
+                    f"  {_ives_s:>7} {_ivxs_s:>7}"
                     f"  {t['iv_entry']:>8.1%}"
                     f"  {t['iv_exit']:>7.1%}"
+                    f"  {_vixen_s:>6} {_vixxs_s:>6}"
                     f"  {iv_min:>6.1%}"
-                    f"  {mind:>5}"
                     f"  {iv_max:>6.1%}"
-                    f"  {maxd:>5}"
                     f"  {iv_chg:>+6.0f}%"
                     f"  {ratio:>6}"
                     f"  {ne_ratio:>6}"
@@ -1229,7 +1302,10 @@ class EarningsLongPutMultiTickerV2(QCAlgorithm):
             self._ol(lines, f"{'═'*72}")
             self._ol(lines, f"  ALL TICKERS COMBINED  |  {grand_trades} trade(s)  |  Wins: {grand_wins}/{grand_trades}  |  Max concurrent positions: {self._max_concurrent}")
             avg_h = grand_hedges / grand_trades if grand_trades else 0.0
+            grand_iv_fails = sum(ts["iv_sample_fails"] for ts in self._ts.values())
+            grand_iv_fails_wu = sum(ts["iv_sample_fails_warmup"] for ts in self._ts.values())
             self._ol(lines, f"  Combined PnL: ${grand_total:+,.2f}  |  Avg PnL/trade: ${grand_total / grand_trades:+,.2f}  |  Hedges: {grand_hedges} total, {avg_h:.1f} avg/trade" if grand_trades else f"  Combined PnL: ${grand_total:+,.2f}")
+            self._ol(lines, f"  IV sample fails: {grand_iv_fails} live, {grand_iv_fails_wu} warmup")
             self._ol(lines, f"{'═'*72}")
 
         # ── Persist full log to ObjectStore (no 100 KB cap) ──────────────
