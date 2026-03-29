@@ -405,6 +405,8 @@ class EarningsLongPutMultiTickerV2(QCAlgorithm):
     # ── Position management (10:00 AM — 30 min after open) ────────────────────
 
     def _manage_position(self, ticker):
+        if self.IsWarmingUp:
+            return
         ts = self._ts[ticker]
 
         # ── Finalize any emergency exit from a stock split ──────────
@@ -761,6 +763,9 @@ class EarningsLongPutMultiTickerV2(QCAlgorithm):
         ts = self._ts[ticker]
 
         self._sample_iv(ticker)
+
+        if self.IsWarmingUp:
+            return
 
         # DYNAMIC_ENTRY: scan for entry at EOD when Greeks are reliable
         if DYNAMIC_ENTRY and ts["state"] == "FLAT" and ts["chain"] is not None:

@@ -376,6 +376,8 @@ class ShortPutIVRankAlgo(QCAlgorithm):
     # ── Position management (TRADE_TIME_MIN after open) ───────────────────────
 
     def _manage_position(self, ticker):
+        if self.IsWarmingUp:
+            return
         ts = self._ts[ticker]
 
         if ts["state"] == "EMERGENCY_PENDING":
@@ -599,6 +601,9 @@ class ShortPutIVRankAlgo(QCAlgorithm):
 
         # Always sample IV (even when FLAT / warming up)
         self._sample_iv(ticker)
+
+        if self.IsWarmingUp:
+            return
 
         # Keep put contract subscribed so it stays in the chain regardless of price drift
         if ts["state"] == "ACTIVE" and ts.get("put_symbol") is not None:
