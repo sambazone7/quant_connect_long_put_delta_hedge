@@ -617,8 +617,7 @@ class EarningsLongPutMultiTickerV2(QCAlgorithm):
         if active > self._max_concurrent:
             self._max_concurrent = active
 
-        vix_px = self.Securities[self._vix_symbol].Price
-        ts["vix_entry"] = vix_px if vix_px > 0 else None
+        ts["vix_entry"] = self._get_vix()
 
     # ── Exit ──────────────────────────────────────────────────────────────────
 
@@ -629,8 +628,7 @@ class EarningsLongPutMultiTickerV2(QCAlgorithm):
         if ts.get("force_exited"):
             return   # already emergency-closed (e.g. stock split)
 
-        vix_px = self.Securities[self._vix_symbol].Price
-        ts["vix_exit"] = vix_px if vix_px > 0 else None
+        ts["vix_exit"] = self._get_vix()
 
         # Read exit IV from chain (for logging + min/max tracking)
         put_exit_iv = 0.0
@@ -982,6 +980,16 @@ class EarningsLongPutMultiTickerV2(QCAlgorithm):
         n = min(IV_RANK_SMOOTH_N, len(vals) // 4)
         n = max(n, 1)
         return sum(vals[:n]) / n, sum(vals[-n:]) / n
+
+    def _get_vix(self):
+        """Fetch today's VIX close via History() to avoid stale Securities[].Price."""
+        try:
+            h = self.History(self._vix_symbol, 1, Resolution.Daily)
+            if not h.empty:
+                return float(h["close"].iloc[-1])
+        except Exception:
+            pass
+        return None
 
     def _compute_iv_rank(self, ticker, current_iv):
         """Compute IV Rank from the stored history. Returns 0-100 or None if insufficient data."""

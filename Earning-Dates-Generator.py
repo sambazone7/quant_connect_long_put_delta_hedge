@@ -4,10 +4,9 @@ from collections import defaultdict
 import time
 
 tickers = [
-   "AAPL","GOOGL","GOOG","MSFT","NVDA","NFLX","MRVL","PLTR","AMZN","TSLA","PYPL","MSTR",
-"AMD","PANW","LRCX","AVGO","INTC","META","WBD","TXN","DASH","SHOP","ZS","CMCSA","KHC","GILD","ADBE","DDOG","WMT","APP","MU","QCOM",
-"CRWD","WDC","TMUS","CSCO","TEAM","ARM","MELI","CSX","PEP","HON","SBUX","COST","ROST","CEG","PDD","STX","WDAY","ADP","MDLZ","MAR","INTU","AMAT",
-"FTNT","ABNB","MCHP","ADI","CDNS","TTWO","ISRG","ASML","CHTR","BKNG","ADSK","GEHC","AMGN","REGN","SNPS","DXCM","VRTX","CTAS","EA"
+   "VZ", "PFE", "BA", "BX", "T", "MO", "CVX", "BAC", "KO", "UNH", "XOM", "BSX", "WMT", "BRK.B", "ABT", "BMY", "HD", "CME", "NEE", "SO", "RTX", "ABBV", 
+"ETN", "JNJ", "MS", "PM", "JPM", "FI", "C", "HON", "GS", "ACN", "GE", "MCD", "MRK", "MA", "BLK", "LLY", "DIS", "COF", "PG", "WFC", "DHR", "V", "IBM", 
+"CAT", "AXP", "TJX", "SCHW", "DE", "COP", "SPGI", "UNP", "GEV", "MDT", "LOW", "LMT", "CI", "TMO", "PGR", "MCK"
 ]
 
 start = datetime(2020, 1, 1)

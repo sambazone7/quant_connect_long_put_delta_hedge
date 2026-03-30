@@ -5,11 +5,12 @@ Bucket analysis of parsed trade CSV.
 Usage:
     python analyze_trades.py <input.csv> <output.txt>
 
-Runs four analyses (all using sim_pnl as the PnL metric):
+Runs five analyses (all using sim_pnl as the PnL metric):
   A. IV Percentile at Entry (perc_iv_en) vs sim_pnl
   B. IV/RV Ratio (iv_rv) vs sim_pnl
   C. IV Rank at Entry (ivr) vs sim_pnl
   D. VIX at Entry (vix_entry) vs sim_pnl
+  E. IV at Entry Sample (iv_enter_sample) vs sim_pnl
 """
 import csv, statistics, argparse
 
@@ -203,6 +204,26 @@ def main():
             run_bucket_analysis(out, rows_vix, vix_buckets, "VIX", "vix_entry vs sim_pnl")
         else:
             out.write("  (no valid data for vix_entry)\n")
+
+        out.write("\n\n")
+
+        # ── Section E: IV at Entry Sample ─────────────────────────────────
+        rows_ivs = load_column(csv_rows, "iv_enter_sample", strip_pct=True)
+        out.write("=" * 80 + "\n")
+        out.write("E. IV AT ENTRY SAMPLE (iv_enter_sample) vs sim_pnl\n")
+        out.write(f"   Valid trades: {len(rows_ivs)}\n")
+        out.write("=" * 80 + "\n\n")
+
+        if rows_ivs:
+            ivs_buckets = [
+                ("IVs < 20%",  lambda x: x < 20),
+                ("IVs 20-30%", lambda x: 20 <= x < 30),
+                ("IVs 30-40%", lambda x: 30 <= x < 40),
+                ("IVs 40%+",   lambda x: x >= 40),
+            ]
+            run_bucket_analysis(out, rows_ivs, ivs_buckets, "IVs", "iv_enter_sample vs sim_pnl")
+        else:
+            out.write("  (no valid data for iv_enter_sample)\n")
 
         out.write("\n")
 
