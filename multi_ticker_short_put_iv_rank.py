@@ -12,7 +12,7 @@ RANK_THRESHOLD  = 1      # Minimum IV Rank (0-100) to trigger entry
 NDAYS_CLOSE     = 28     # Close after this many calendar days; also entry earnings window [today, today+NDAYS_CLOSE]
 EARNINGS_BUFFER = 10     # (Reserved) documented for future use — not applied in entry logic today
 SKIP_EARNINGS_GUARD = False  # True → skip the entry earnings check below
-IV_LOOKBACK     = 252    # Trading days of IV history for IV Rank min/max
+IV_LOOKBACK     = 160    # Trading days of IV history for IV Rank min/max
 IV_RANK_SMOOTH_N = 10    # Average the N lowest/highest IV samples for rank min/max (1 = raw min/max)
 IV_RANK_TARGET_DTE = 90  # IV rank: closest listed expiry with DTE >= this; OTM put (strike < spot), walk down
 DAYS_AFTER_EARNINGS = 5  # Skip options whose expiry is within this many days after an earnings date
@@ -71,6 +71,8 @@ class ShortPutIVRankAlgo(QCAlgorithm):
 
         self.SetWarmUp(timedelta(days=IV_LOOKBACK + 60))
 
+        self._vix_symbol = self.AddData(CBOE, "VIX", Resolution.Daily).Symbol
+
         tickers = list(MANUAL_EARNINGS_DATES.keys())
 
         self._ts = {}
@@ -122,6 +124,10 @@ class ShortPutIVRankAlgo(QCAlgorithm):
                 "force_exited":     False,
                 "put_spread_entry": 0,
                 "put_spread_exit":  0,
+                "vix_entry":        None,
+                "vix_exit":         None,
+                "entry_iv_pctl":    None,
+                "exit_iv_pctl":     None,
             }
 
             self.Schedule.On(
@@ -247,6 +253,10 @@ class ShortPutIVRankAlgo(QCAlgorithm):
                             "iv_hist_max":      ts["iv_hist_max"],
                             "put_spread_entry": ts["put_spread_entry"],
                             "put_spread_exit":  0,
+                            "vix_entry":        ts["vix_entry"],
+                            "vix_exit":         ts["vix_exit"],
+                            "entry_iv_pctl":    ts["entry_iv_pctl"],
+                            "exit_iv_pctl":     ts["exit_iv_pctl"],
                         })
                         self.Log(f"  [{self.Time.date()}] FORCED EXIT FINALIZED: "
                                  f"{ticker} put=${fill_price:.2f} "
@@ -373,6 +383,14 @@ class ShortPutIVRankAlgo(QCAlgorithm):
             return None if iv_min is None else 0.0
         return (current_iv - iv_min) / (iv_max - iv_min) * 100.0
 
+    def _compute_iv_percentile(self, ticker, current_iv):
+        """IV Percentile: % of days in iv_history where IV was below current_iv."""
+        ts = self._ts[ticker]
+        if len(ts["iv_history"]) < IV_LOOKBACK:
+            return None
+        below = sum(1 for _, iv in ts["iv_history"] if iv < current_iv)
+        return below / len(ts["iv_history"]) * 100.0
+
     # ── Position management (TRADE_TIME_MIN after open) ───────────────────────
 
     def _manage_position(self, ticker):
@@ -498,6 +516,7 @@ class ShortPutIVRankAlgo(QCAlgorithm):
         ts["stock_entry_price"] = s_price
         ts["entry_date"]        = today
         ts["entry_iv_rank"]     = iv_rank
+        ts["entry_iv_pctl"]     = self._compute_iv_percentile(ticker, current_iv)
         ts["entry_rv"]          = rv
         ts["iv_trade_min"]      = entry_iv
         ts["iv_trade_max"]      = entry_iv
@@ -516,6 +535,8 @@ class ShortPutIVRankAlgo(QCAlgorithm):
         self.MarketOrder(ts["stock_symbol"], n_shares)
         self._filling_ticker = None
 
+        ts["vix_entry"] = self._get_vix()
+
         active = sum(1 for t in self._ts.values() if t["state"] == "ACTIVE")
         if active > self._max_concurrent:
             self._max_concurrent = active
@@ -528,6 +549,8 @@ class ShortPutIVRankAlgo(QCAlgorithm):
             return
         if ts.get("force_exited"):
             return
+
+        ts["vix_exit"] = self._get_vix()
 
         if ts.get("put_symbol") is not None:
             _res = Resolution.Hour if HOURLY_BARS else Resolution.Minute
@@ -542,6 +565,20 @@ class ShortPutIVRankAlgo(QCAlgorithm):
                     except Exception:
                         put_exit_iv = 0.0
                     break
+
+        today = self.Time.date()
+        s_price = self.Securities[ts["stock_symbol"]].Price
+        exit_rank_iv = 0.0
+        exit_rank_put = self._put_for_iv_rank(ts["chain"], today, s_price)
+        if exit_rank_put is not None:
+            try:
+                exit_rank_iv = exit_rank_put.ImpliedVolatility
+            except Exception:
+                exit_rank_iv = 0.0
+        if exit_rank_iv <= 0 and ts["iv_history"]:
+            exit_rank_iv = ts["iv_history"][-1][1]
+        if exit_rank_iv > 0:
+            ts["exit_iv_pctl"] = self._compute_iv_percentile(ticker, exit_rank_iv)
 
         n_contracts = ts["put_contracts"]
         n_shares    = ts["stock_qty"]
@@ -591,6 +628,10 @@ class ShortPutIVRankAlgo(QCAlgorithm):
             "iv_hist_max":      ts["iv_hist_max"],
             "put_spread_entry": ts["put_spread_entry"],
             "put_spread_exit":  ts["put_spread_exit"],
+            "vix_entry":        ts["vix_entry"],
+            "vix_exit":         ts["vix_exit"],
+            "entry_iv_pctl":    ts["entry_iv_pctl"],
+            "exit_iv_pctl":     ts["exit_iv_pctl"],
         })
         self._reset(ticker)
 
@@ -803,6 +844,16 @@ class ShortPutIVRankAlgo(QCAlgorithm):
         except Exception:
             return 0.0
 
+    def _get_vix(self):
+        """Fetch most recent VIX close via History() with 5-day lookback."""
+        try:
+            h = self.History(self._vix_symbol, 5, Resolution.Daily)
+            if not h.empty:
+                return float(h["close"].iloc[-1])
+        except Exception:
+            pass
+        return None
+
     # ── Emergency exit (stock split / auto-liquidation) ───────────────────────
 
     def _emergency_exit(self, ticker, reason):
@@ -861,6 +912,10 @@ class ShortPutIVRankAlgo(QCAlgorithm):
             "iv_hist_max":      ts["iv_hist_max"],
             "put_spread_entry": ts["put_spread_entry"],
             "put_spread_exit":  0,
+            "vix_entry":        ts["vix_entry"],
+            "vix_exit":         ts["vix_exit"],
+            "entry_iv_pctl":    ts["entry_iv_pctl"],
+            "exit_iv_pctl":     ts["exit_iv_pctl"],
         })
         self._reset(ticker)
 
@@ -887,6 +942,10 @@ class ShortPutIVRankAlgo(QCAlgorithm):
         ts["force_exited"]      = False
         ts["put_spread_entry"]  = 0
         ts["put_spread_exit"]   = 0
+        ts["vix_entry"]         = None
+        ts["vix_exit"]          = None
+        ts["entry_iv_pctl"]     = None
+        ts["exit_iv_pctl"]      = None
 
     # ── End-of-backtest summary ───────────────────────────────────────────────
 
@@ -932,6 +991,14 @@ class ShortPutIVRankAlgo(QCAlgorithm):
                 D = "$"
                 _pen = t.get("put_price_entry", 0.0)
                 _pex = t.get("put_price_exit", 0.0)
+                _vixen = t.get("vix_entry")
+                _vixxs = t.get("vix_exit")
+                _vixen_s = f"{_vixen:.1f}" if _vixen else "n/a"
+                _vixxs_s = f"{_vixxs:.1f}" if _vixxs else "n/a"
+                _pivEn = t.get("entry_iv_pctl")
+                _pivEx = t.get("exit_iv_pctl")
+                _pivEn_s = f"{_pivEn:.0f}" if _pivEn is not None else "n/a"
+                _pivEx_s = f"{_pivEx:.0f}" if _pivEx is not None else "n/a"
                 self._ol(lines,
                     f"  {tag} {t['entry_date']!s:<11} {t['exit_date']!s:<11} days={t['held_days']}"
                     f"  PutPnL={D}{t['put_pnl']:>+,.0f}"
@@ -940,7 +1007,9 @@ class ShortPutIVRankAlgo(QCAlgorithm):
                     f"  Stk={chg:>+.1f}%"
                     f"  PnL={D}{t['total']:>+,.0f}"
                     f"  IVR={t['iv_rank_entry']:.0f} IV/RV={ratio}"
+                    f"  Pctl={_pivEn_s:>4} PctlEx={_pivEx_s:>4}"
                     f"  IVen={t['iv_entry']:.1%} IVex={t['iv_exit']:.1%}"
+                    f"  VIXen={_vixen_s:>6} VIXex={_vixxs_s:>6}"
                     f"  TrMin={_tmin:.1%} TrMax={_tmax:.1%}"
                     f"  HMin={_hmin:.1%} HMax={_hmax:.1%}"
                     f"  SpEn={_pse} SpEx={_psx}"

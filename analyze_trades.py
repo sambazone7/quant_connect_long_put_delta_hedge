@@ -5,14 +5,17 @@ Bucket analysis of parsed trade CSV.
 Usage:
     python analyze_trades.py <input.csv> <output.txt>
 
-Runs five analyses (all using sim_pnl as the PnL metric):
+Runs seven analyses (all using sim_pnl as the PnL metric):
   A. IV Percentile at Entry (perc_iv_en) vs sim_pnl
   B. IV/RV Ratio (iv_rv) vs sim_pnl
   C. IV Rank at Entry (ivr) vs sim_pnl
   D. VIX at Entry (vix_entry) vs sim_pnl
   E. IV at Entry Sample (iv_enter_sample) vs sim_pnl
+  F. IV at Entry (iv_entry) vs sim_pnl  [quartile buckets]
+  G. Per-Ticker IV % Increase (iv_entry -> iv_exit)
 """
 import csv, statistics, argparse
+from collections import defaultdict
 
 
 def pearson(xs, ys):
@@ -224,6 +227,100 @@ def main():
             run_bucket_analysis(out, rows_ivs, ivs_buckets, "IVs", "iv_enter_sample vs sim_pnl")
         else:
             out.write("  (no valid data for iv_enter_sample)\n")
+
+        out.write("\n\n")
+
+        # ── Section F: IV at Entry (quartile buckets) ────────────────────────
+        rows_iven = load_column(csv_rows, "iv_entry", strip_pct=True)
+        out.write("=" * 80 + "\n")
+        out.write("F. IV AT ENTRY (iv_entry) vs sim_pnl  [quartile buckets]\n")
+        out.write(f"   Valid trades: {len(rows_iven)}\n")
+        out.write("=" * 80 + "\n\n")
+
+        if rows_iven:
+            vals_sorted = sorted(v for v, _ in rows_iven)
+            q1, q2, q3 = statistics.quantiles(vals_sorted, n=4)
+            out.write(f"  Quartile breakpoints: Q1={q1:.1f}%  Q2={q2:.1f}%  Q3={q3:.1f}%\n\n")
+
+            iven_buckets = [
+                (f"IVen < {q1:.1f}%",        lambda x, _q1=q1: x < _q1),
+                (f"IVen {q1:.1f}-{q2:.1f}%", lambda x, _q1=q1, _q2=q2: _q1 <= x < _q2),
+                (f"IVen {q2:.1f}-{q3:.1f}%", lambda x, _q2=q2, _q3=q3: _q2 <= x < _q3),
+                (f"IVen >= {q3:.1f}%",        lambda x, _q3=q3: x >= _q3),
+            ]
+            run_bucket_analysis(out, rows_iven, iven_buckets, "IVen", "iv_entry vs sim_pnl")
+        else:
+            out.write("  (no valid data for iv_entry)\n")
+
+        out.write("\n\n")
+
+        # ── Section G: Per-Ticker IV % Increase (iv_entry -> iv_exit) ────────
+        out.write("=" * 80 + "\n")
+        out.write("G. PER-TICKER IV % INCREASE  (iv_exit - iv_entry) / iv_entry\n")
+        out.write("=" * 80 + "\n\n")
+
+        ticker_pcts = defaultdict(list)
+        ticker_pnls = defaultdict(list)
+        ticker_ivrv = defaultdict(list)
+        skipped = 0
+        for r in csv_rows:
+            tk = r.get("ticker", "").strip()
+            iv_en_raw = r.get("iv_entry", "").strip().rstrip("%")
+            iv_ex_raw = r.get("iv_exit", "").strip().rstrip("%")
+            sim_raw = r.get("sim_pnl", "").strip().replace(",", "").replace("+", "")
+            ivrv_raw = r.get("iv_rv", "").strip()
+            if not iv_en_raw or not iv_ex_raw or not tk:
+                skipped += 1
+                continue
+            try:
+                iv_en = float(iv_en_raw)
+                iv_ex = float(iv_ex_raw)
+                sim = float(sim_raw) if sim_raw else 0.0
+            except Exception:
+                skipped += 1
+                continue
+            if iv_en == 0:
+                skipped += 1
+                continue
+            ticker_pcts[tk].append((iv_ex - iv_en) / iv_en * 100)
+            ticker_pnls[tk].append(sim)
+            try:
+                if ivrv_raw and ivrv_raw != "n/a":
+                    ticker_ivrv[tk].append(float(ivrv_raw))
+            except Exception:
+                pass
+
+        all_pcts = [p for vals in ticker_pcts.values() for p in vals]
+        all_pnls_g = [p for vals in ticker_pnls.values() for p in vals]
+        all_ivrv = [v for vals in ticker_ivrv.values() for v in vals]
+        out.write(f"  Valid trades: {len(all_pcts)}   Skipped: {skipped}\n")
+        out.write(f"  Unique tickers: {len(ticker_pcts)}\n\n")
+
+        hdr_g = f"  {'Ticker':<8} {'Trades':>6} {'Avg IV % Increase':>18} {'Median':>10} {'Avg PnL':>12} {'Avg IV/RV':>10}"
+        out.write(hdr_g + "\n")
+        out.write("  " + "-" * (len(hdr_g) - 2) + "\n")
+
+        tickers_by_iv = sorted(ticker_pcts, key=lambda t: sum(ticker_pcts[t]) / len(ticker_pcts[t]), reverse=True)
+        for tk in tickers_by_iv:
+            vals = ticker_pcts[tk]
+            pnls_tk = ticker_pnls[tk]
+            ivrv_tk = ticker_ivrv.get(tk, [])
+            avg = sum(vals) / len(vals)
+            med = statistics.median(vals)
+            avg_pnl = sum(pnls_tk) / len(pnls_tk)
+            avg_ivrv = sum(ivrv_tk) / len(ivrv_tk) if ivrv_tk else 0
+            ivrv_str = f"{avg_ivrv:>10.2f}" if ivrv_tk else f"{'n/a':>10}"
+            out.write(f"  {tk:<8} {len(vals):>6} {avg:>+17.1f}% {med:>+9.1f}% {avg_pnl:>+12,.2f} {ivrv_str}\n")
+
+        if all_pcts:
+            overall_avg = sum(all_pcts) / len(all_pcts)
+            overall_med = statistics.median(all_pcts)
+            overall_pnl = sum(all_pnls_g) / len(all_pnls_g)
+            overall_ivrv = sum(all_ivrv) / len(all_ivrv) if all_ivrv else 0
+            out.write("  " + "-" * (len(hdr_g) - 2) + "\n")
+            out.write(f"  {'OVERALL':<8} {len(all_pcts):>6} {overall_avg:>+17.1f}% {overall_med:>+9.1f}% {overall_pnl:>+12,.2f} {overall_ivrv:>10.2f}\n")
+            avg_of_avgs = sum(sum(v) / len(v) for v in ticker_pcts.values()) / len(ticker_pcts)
+            out.write(f"\n  Avg of per-ticker avgs (equal-weight): {avg_of_avgs:+.1f}%\n")
 
         out.write("\n")
 

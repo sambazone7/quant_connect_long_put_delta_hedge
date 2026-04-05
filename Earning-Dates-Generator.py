@@ -4,9 +4,7 @@ from collections import defaultdict
 import time
 
 tickers = [
-   "VZ", "PFE", "BA", "BX", "T", "MO", "CVX", "BAC", "KO", "UNH", "XOM", "BSX", "WMT", "BRK.B", "ABT", "BMY", "HD", "CME", "NEE", "SO", "RTX", "ABBV", 
-"ETN", "JNJ", "MS", "PM", "JPM", "FI", "C", "HON", "GS", "ACN", "GE", "MCD", "MRK", "MA", "BLK", "LLY", "DIS", "COF", "PG", "WFC", "DHR", "V", "IBM", 
-"CAT", "AXP", "TJX", "SCHW", "DE", "COP", "SPGI", "UNP", "GEV", "MDT", "LOW", "LMT", "CI", "TMO", "PGR", "MCK"
+   "AAPL", "GOOGL", "MSFT", "AMZN", "TSLA", "META", "AVGO", "PLTR", "ASML", "NFLX", "AMD", "MU", "CSCO", "ABNB"
 ]
 
 start = datetime(2020, 1, 1)

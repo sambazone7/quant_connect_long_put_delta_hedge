@@ -127,9 +127,9 @@ class EarningsLongPutMultiTickerV2(QCAlgorithm):
     # ── Initialise ────────────────────────────────────────────────────────────
 
     def Initialize(self):
-        self.SetStartDate(2022, 1, 1)
+        self.SetStartDate(2020, 1, 1)
         self.SetEndDate(2026, 2, 20)
-        self.SetCash(20_000_000)
+        self.SetCash(5_000_000)
 
         self.SetWarmUp(timedelta(days=IV_LOOKBACK + 60))
 
@@ -982,9 +982,9 @@ class EarningsLongPutMultiTickerV2(QCAlgorithm):
         return sum(vals[:n]) / n, sum(vals[-n:]) / n
 
     def _get_vix(self):
-        """Fetch today's VIX close via History() to avoid stale Securities[].Price."""
+        """Fetch most recent VIX close via History() with 5-day lookback."""
         try:
-            h = self.History(self._vix_symbol, 1, Resolution.Daily)
+            h = self.History(self._vix_symbol, 5, Resolution.Daily)
             if not h.empty:
                 return float(h["close"].iloc[-1])
         except Exception:
