@@ -108,15 +108,17 @@ def parse_market_cap(value: str) -> float:
 
 
 def parse_mcap_cell(text: str) -> float:
-    """Parse a market cap cell like '1.23B', '450.00M' into millions."""
+    """Parse a market cap cell like '1.98T', '1.23B', '450.00M' into millions."""
     if not text or text in ("-", "N/A", ""):
         return 0.0
     text = text.strip().upper().replace(",", "")
-    m = re.match(r"([\d.]+)\s*([BMK]?)", text)
+    m = re.match(r"([\d.]+)\s*([TBMK]?)", text)
     if not m:
         return 0.0
     num, unit = float(m.group(1)), m.group(2)
-    if unit == "B":
+    if unit == "T":
+        return num * 1_000_000
+    elif unit == "B":
         return num * 1000
     elif unit == "M":
         return num

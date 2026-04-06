@@ -31,9 +31,6 @@ DRIFT_FLOOR   = 0.10  # (gamma/theta mode) Max |position_delta| as fraction of o
 D_mult  = 1.0    # (sigma mode) tolerance = D_mult × daily_sigma_frac × |option_exposure|
 RV_SIGMA = True   # (sigma mode) True → live 30-day RV | False → put's live IV (fallback entry IV)
 F      = 0        # Minimum calendar days after earnings date for put expiry
-EXPIRE_SERIES = 0  # 0 → closest expiry after earnings (default)
-                   # 1 → second closest weekly expiry after earnings
-                   #     (falls back to closest if no weeklies available)
 Z      = 0.0      # IV/RV filter: skip entry if IV/RV >= Z  (0.0 = disabled)
 MAX_PUT_PCT = 0.15  # Sanity: skip entry if put_mid > stock_price × MAX_PUT_PCT
 PUT_LIMIT_MULT = 1.2  # Limit order at put_mid × this (prevents bad fills)
