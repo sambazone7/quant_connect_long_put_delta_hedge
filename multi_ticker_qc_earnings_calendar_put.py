@@ -3,10 +3,16 @@ from AlgorithmImports import *
 from datetime import timedelta, date as Date
 import math
 from cal_config import *
+import cal_exit_handlers as _h
 # endregion
 
 
 class EarningsCalendarPutMultiTicker(QCAlgorithm):
+    _immediate_close_all    = _h._immediate_close_all
+    _finalize_forced_exit   = _h._finalize_forced_exit
+    _emergency_exit         = _h._emergency_exit
+    _finalize_emergency_exit = _h._finalize_emergency_exit
+    _check_orphaned_positions = _h._check_orphaned_positions
     """
     
     """
@@ -74,7 +80,9 @@ class EarningsCalendarPutMultiTicker(QCAlgorithm):
                 "earnings_dates":  dates,
                 "traded_earnings": set(),
                 "trade_log":       [],
+                "hedge_count":     0,
                 "force_exited":    False,
+                "_closing_forced": False,   # True while a forced-exit function is actively closing legs
                 "orphan_cleaned":  False,   # True after FLAT-state orphan stock sold (prevent repeats)
                 "total_fees":      0.0,     # accumulated order fees for this ticker cycle
                 # ── Bid-ask spread cost tracking ──
@@ -155,7 +163,7 @@ class EarningsCalendarPutMultiTicker(QCAlgorithm):
                 split = data.Splits[ts["stock_symbol"]]
                 if split.Type == SplitType.SplitOccurred:
                     if ts["state"] in ("ACTIVE", "EMERGENCY_PENDING"):
-                        if ts["stock_qty"] > 0 and split.SplitFactor > 0:
+                        if ts["stock_qty"] != 0 and split.SplitFactor > 0:
                             ts["stock_qty"] = round(ts["stock_qty"] / split.SplitFactor)
                     if ts["state"] == "ACTIVE" and not ts.get("force_exited"):
                         self._emergency_exit(ticker, f"{ticker} split {split.SplitFactor}")
@@ -245,7 +253,8 @@ class EarningsCalendarPutMultiTicker(QCAlgorithm):
                 else:
                     ts["put_exit_fill"] = fill_price
                     if ts.get("force_exited"):
-                        self._finalize_forced_exit(ticker)
+                        if not ts.get("_closing_forced"):
+                            self._finalize_forced_exit(ticker)
                         return
                     # Detect auto-liquidation: long put sold but NOT by our code
                     if self._filling_ticker != ticker:
@@ -263,7 +272,8 @@ class EarningsCalendarPutMultiTicker(QCAlgorithm):
                     # We bought back the short put (exit) — likely ASSIGNMENT
                     ts["short_put_exit_fill"] = fill_price
                     if ts.get("force_exited"):
-                        self._finalize_forced_exit(ticker)
+                        if not ts.get("_closing_forced"):
+                            self._finalize_forced_exit(ticker)
                         return
                     # Detect assignment / auto-liquidation of short put
                     if self._filling_ticker != ticker:
@@ -594,7 +604,12 @@ class EarningsCalendarPutMultiTicker(QCAlgorithm):
         self._filling_ticker = ticker
         if n_contracts > 0:
             self.MarketOrder(ts["put_symbol"], -n_contracts)          # sell long put
-            self.MarketOrder(ts["short_put_symbol"], n_contracts)     # buy back short put
+            # Only buy back short put if we actually hold it (may already be assigned)
+            short_qty = 0
+            if self.Portfolio.ContainsKey(ts["short_put_symbol"]):
+                short_qty = self.Portfolio[ts["short_put_symbol"]].Quantity
+            if short_qty != 0:
+                self.MarketOrder(ts["short_put_symbol"], -short_qty)
         if n_shares != 0:
             self.MarketOrder(ts["stock_symbol"], -n_shares)
         self._filling_ticker = None
@@ -641,6 +656,7 @@ class EarningsCalendarPutMultiTicker(QCAlgorithm):
             "short_spread_entry": ts["short_spread_entry"],
             "long_spread_exit":   ts["long_spread_exit"],
             "short_spread_exit":  ts["short_spread_exit"],
+            "hedge_count":        ts["hedge_count"],
         })
 
         # ── Post-exit reconciliation: verify portfolio is actually flat ────
@@ -717,61 +733,89 @@ class EarningsCalendarPutMultiTicker(QCAlgorithm):
         if s_price <= 0:
             return
 
-        # ── Step 1: Compute live position delta ──────────────────────────────
-        long_delta  = None
-        short_delta = None
-        cur_iv      = 0.0
+        # ── Step 1: Compute live Greeks for both legs ────────────────────────
+        long_delta = long_gamma = long_theta = None
+        short_delta = short_gamma = short_theta = None
+        cur_iv = 0.0
 
         for c in ts["chain"]:
             if c.Symbol == ts["put_symbol"]:
                 long_delta = c.Greeks.Delta
+                long_gamma = c.Greeks.Gamma
+                long_theta = c.Greeks.Theta
                 try:
                     cur_iv = c.ImpliedVolatility
                 except Exception:
                     cur_iv = 0.0
             elif c.Symbol == ts.get("short_put_symbol"):
                 short_delta = c.Greeks.Delta
+                short_gamma = c.Greeks.Gamma
+                short_theta = c.Greeks.Theta
 
         if long_delta is None or long_delta == 0.0:
             return   # long put not in chain or stale — cannot compute delta
 
-        # If short put not in chain or returning stale 0.0 Greeks
-        # (common near expiry), skip hedge to preserve current stock position.
         if short_delta is None or short_delta == 0.0:
             self._log(f"  [{ticker}] HEDGE SKIPPED: short delta stale "
                       f"(long_d={long_delta:.4f}, stock_qty={ts['stock_qty']:.0f})")
             return
 
-        # Combined option delta:
-        #   long put:  +n_contracts → long_delta × n × 100
-        #   short put: −n_contracts → −short_delta × n × 100
+        # Combined option Greeks (long n puts, short n puts):
         n = ts["put_contracts"]
         option_delta = (long_delta - short_delta) * n * 100
 
         stock_delta    = ts["stock_qty"]
         position_delta = stock_delta + option_delta
 
-        # ── Step 2: Daily sigma fraction ─────────────────────────────────────
-        if RV_SIGMA:
-            rv = self._calc_realized_vol(ts["stock_symbol"], 30)
-            if rv <= 0:
-                return
-            daily_sigma_frac = rv / (252 ** 0.5)
-        else:
-            sigma_iv = cur_iv if cur_iv > 0 else ts["put_entry_iv"]
-            if sigma_iv <= 0:
-                return
-            daily_sigma_frac = sigma_iv / (252 ** 0.5)
-
-        # ── Step 3: Tolerance (in shares) ────────────────────────────────────
+        # ── Step 2: Hedge trigger ────────────────────────────────────────────
         option_exposure = abs(n * 100)
-        tolerance = D_mult * daily_sigma_frac * option_exposure
 
-        # ── Step 4: Hedge decision ───────────────────────────────────────────
-        if abs(position_delta) <= tolerance:
-            return   # within tolerance — do nothing
+        if HEDGE_MODE in ("gamma", "theta"):
+            _lg = long_gamma if long_gamma else 0.0
+            _sg = short_gamma if short_gamma else 0.0
+            _lt = long_theta if long_theta else 0.0
+            _st = short_theta if short_theta else 0.0
 
-        # Re-hedge to delta-neutral: target stock qty offsets option delta
+            net_gamma = (_lg - _sg) * n * 100
+            net_theta = (_lt - _st) * n * 100
+            total_gamma = abs(net_gamma)
+
+            if HEDGE_MODE == "theta":
+                daily_theta_pos = abs(net_theta) / 365.0
+                pnl_tol = max(THETA_K * daily_theta_pos, MIN_TOLERANCE)
+            else:
+                pnl_tol = PNL_TOLERANCE
+
+            if total_gamma <= 1e-10:
+                if abs(position_delta) <= 1:
+                    return
+            else:
+                delta_s_trigger = (2.0 * pnl_tol / total_gamma) ** 0.5
+                stock_move = abs(s_price - ts["last_hedge_price"])
+
+                max_drift = DRIFT_FLOOR * option_exposure
+                if abs(position_delta) > max_drift:
+                    pass  # fall through to hedge
+                elif stock_move < delta_s_trigger:
+                    return
+
+        else:
+            if RV_SIGMA:
+                rv = self._calc_realized_vol(ts["stock_symbol"], 30)
+                if rv <= 0:
+                    return
+                daily_sigma_frac = rv / (252 ** 0.5)
+            else:
+                sigma_iv = cur_iv if cur_iv > 0 else ts["put_entry_iv"]
+                if sigma_iv <= 0:
+                    return
+                daily_sigma_frac = sigma_iv / (252 ** 0.5)
+
+            tolerance = D_mult * daily_sigma_frac * option_exposure
+            if abs(position_delta) <= tolerance:
+                return
+
+        # ── Step 3: Execute hedge ────────────────────────────────────────────
         target = round(-option_delta)
         adj    = target - ts["stock_qty"]
         if adj == 0:
@@ -785,6 +829,7 @@ class EarningsCalendarPutMultiTicker(QCAlgorithm):
         self.MarketOrder(ts["stock_symbol"], adj)
         self._filling_ticker = None
 
+        ts["hedge_count"] += 1
         ts["last_hedge_price"] = s_price
 
     # ── Helpers ───────────────────────────────────────────────────────────────
@@ -817,400 +862,6 @@ class EarningsCalendarPutMultiTicker(QCAlgorithm):
         except Exception:
             return 0.0
 
-    # ── Immediate close (assignment / auto-liquidation detected in OnOrderEvent) ─
-
-    def _immediate_close_all(self, ticker, reason):
-        """Close ALL remaining legs immediately from inside OnOrderEvent.
-        Used when an unexpected fill (assignment / auto-liquidation) is detected
-        so that no positions are left orphaned."""
-        ts = self._ts[ticker]
-        if ts.get("force_exited"):
-            return
-        ts["force_exited"] = True
-
-        self._log(f"  [{self.Time.date()}] IMMEDIATE CLOSE ({reason}): "
-                 f"ticker={ticker} — closing all legs now")
-
-        self._filling_ticker = ticker
-
-        # ── Close long put if still held ──────────────────────────────
-        if ts.get("put_symbol"):
-            try:
-                long_qty = self.Portfolio[ts["put_symbol"]].Quantity \
-                           if self.Portfolio.ContainsKey(ts["put_symbol"]) else 0
-            except Exception:
-                long_qty = 0
-            if long_qty != 0:
-                self.MarketOrder(ts["put_symbol"], -long_qty)
-
-        # ── Close short put if still held ─────────────────────────────
-        if ts.get("short_put_symbol"):
-            try:
-                short_qty = self.Portfolio[ts["short_put_symbol"]].Quantity \
-                            if self.Portfolio.ContainsKey(ts["short_put_symbol"]) else 0
-            except Exception:
-                short_qty = 0
-            if short_qty != 0:
-                self.MarketOrder(ts["short_put_symbol"], -short_qty)
-
-        # ── Close stock ───────────────────────────────────────────────
-        try:
-            stk_qty = self.Portfolio[ts["stock_symbol"]].Quantity \
-                      if self.Portfolio.ContainsKey(ts["stock_symbol"]) else 0
-        except Exception:
-            stk_qty = 0
-        if stk_qty != 0:
-            self.MarketOrder(ts["stock_symbol"], -stk_qty)
-
-        self._filling_ticker = None
-
-        # ── P&L from actual fills (set by OnOrderEvent during the orders above) ─
-        n_contracts = ts["put_contracts"]
-        long_pnl  = (ts["put_exit_fill"] - ts["put_entry_fill"]) * n_contracts * 100
-        short_pnl = (ts["short_put_entry_fill"] - ts["short_put_exit_fill"]) * n_contracts * 100
-        stk_pnl   = ts["stock_realized"]
-        total     = long_pnl + short_pnl + stk_pnl
-
-        self._log(f"  [{self.Time.date()}]  LongPnL=${long_pnl:+,.2f} "
-                 f"ShortPnL=${short_pnl:+,.2f} StkPnL=${stk_pnl:+,.2f} "
-                 f"Total=${total:+,.2f}")
-
-        # Stock % change
-        entry_px = ts["stock_entry_price"]
-        exit_px  = self.Securities[ts["stock_symbol"]].Price if entry_px > 0 else 0.0
-        stk_chg_pct = ((exit_px - entry_px) / entry_px * 100) if entry_px > 0 else 0.0
-
-        ed = ts["entry_earnings"].date() if ts["entry_earnings"] else self.Time.date()
-
-        # Store the short put strike so FLAT-state orphan cleanup can compute
-        # assignment stock P&L if delivery arrives after this reset.
-        short_strike = 0.0
-        if ts.get("short_put_symbol"):
-            try:
-                short_strike = float(self.Securities[ts["short_put_symbol"]].Symbol.ID.StrikePrice)
-            except Exception:
-                short_strike = 0.0
-
-        _short_iv = ts["short_put_entry_iv"]
-        _long_iv  = ts["put_entry_iv"]
-        _rv       = ts["entry_rv"]
-
-        ts["trade_log"].append({
-            "earnings":           ed,
-            "n_contracts":        n_contracts,
-            "long_pnl":           long_pnl,
-            "short_pnl":          short_pnl,
-            "stk_pnl":            stk_pnl,
-            "stk_chg_pct":        stk_chg_pct,
-            "total":              total,
-            "iv_entry":           _long_iv,
-            "iv_exit":            0.0,
-            "rv":                 _rv,
-            "iv_spread_entry":    _long_iv - _short_iv,
-            "short_iv_entry":     _short_iv,
-            "short_iv_rv":        _short_iv / _rv if _rv > 0 else 0.0,
-            "_assign_strike":     short_strike,   # used by FLAT orphan cleanup
-        })
-        ts["traded_earnings"].add(ed)
-        self._reset(ticker)
-
-    # ── Forced-exit finalization (split: stock+other legs closed at Submitted, ──
-    # ── MOC fills arrive at 16:00 — finalize P&L when last fill arrives)      ──
-
-    def _finalize_forced_exit(self, ticker):
-        """Called from put Filled handler when force_exited is True.
-        All legs were closed at Submitted time; this just records the
-        MOC fill price and finalizes P&L."""
-        ts = self._ts[ticker]
-        n = ts["put_contracts"]
-        long_pnl  = (ts["put_exit_fill"] - ts["put_entry_fill"]) * n * 100
-        short_pnl = (ts["short_put_entry_fill"] - ts["short_put_exit_fill"]) * n * 100
-        stk_pnl   = ts["stock_realized"]
-        total     = long_pnl + short_pnl + stk_pnl
-
-        entry_px = ts["stock_entry_price"]
-        exit_px  = self.Securities[ts["stock_symbol"]].Price if entry_px > 0 else 0.0
-        stk_chg_pct = ((exit_px - entry_px) / entry_px * 100) if entry_px > 0 else 0.0
-
-        ed = ts["entry_earnings"].date() if ts["entry_earnings"] else self.Time.date()
-
-        _short_iv = ts["short_put_entry_iv"]
-        _long_iv  = ts["put_entry_iv"]
-        _rv       = ts["entry_rv"]
-
-        ts["trade_log"].append({
-            "earnings":           ed,
-            "n_contracts":        n,
-            "long_pnl":           long_pnl,
-            "short_pnl":          short_pnl,
-            "stk_pnl":            stk_pnl,
-            "stk_chg_pct":        stk_chg_pct,
-            "total":              total,
-            "iv_entry":           _long_iv,
-            "iv_exit":            0.0,
-            "rv":                 _rv,
-            "iv_spread_entry":    _long_iv - _short_iv,
-            "short_iv_entry":     _short_iv,
-            "short_iv_rv":        _short_iv / _rv if _rv > 0 else 0.0,
-            "long_spread_entry":  ts.get("long_spread_entry", 0),
-            "short_spread_entry": ts.get("short_spread_entry", 0),
-            "long_spread_exit":   0,
-            "short_spread_exit":  0,
-        })
-        self._log(f"  [{self.Time.date()}] FORCED EXIT FINALIZED: "
-                  f"{ticker} longPnL=${long_pnl:+,.0f} shortPnL=${short_pnl:+,.0f} "
-                  f"stkPnL=${stk_pnl:+,.0f} total=${total:+,.0f}")
-        ts["traded_earnings"].add(ed)
-        self._reset(ticker)
-
-    # ── Emergency exit (stock split from OnData — deferred) ──────────────────
-
-    def _emergency_exit(self, ticker, reason):
-        """Mark one ticker's position as EMERGENCY_PENDING.
-        Does NOT place orders or calculate P&L — deferred to _finalize_emergency_exit.
-        Used only from OnData (stock split detection), NOT from OnOrderEvent."""
-        ts = self._ts[ticker]
-        if ts["state"] != "ACTIVE" or ts.get("force_exited"):
-            return
-        ts["force_exited"] = True
-        ts["state"]        = "EMERGENCY_PENDING"
-        self._log(f"  [{self.Time.date()}] EMERGENCY EXIT ({reason}): "
-                 f"ticker={ticker} (pending close)")
-
-    def _finalize_emergency_exit(self, ticker):
-        """Called from _manage_position when state is EMERGENCY_PENDING.
-        Closes remaining positions, calculates P&L, logs the trade, resets."""
-        ts = self._ts[ticker]
-        if ts["state"] != "EMERGENCY_PENDING":
-            return
-
-        self._log(f"  [{self.Time.date()}] FINALIZING EMERGENCY EXIT for {ticker}")
-
-        # ── Close long put if still open ──────────────────────────────
-        if ts.get("put_symbol"):
-            long_qty = 0
-            try:
-                if self.Portfolio.ContainsKey(ts["put_symbol"]):
-                    long_qty = self.Portfolio[ts["put_symbol"]].Quantity
-            except Exception:
-                long_qty = 0
-            if long_qty != 0:
-                self._filling_ticker = ticker
-                self.MarketOrder(ts["put_symbol"], -long_qty)
-                self._filling_ticker = None
-
-        # ── Close remaining stock position ──────────────────────────
-        actual_stock_qty = 0
-        if self.Portfolio.ContainsKey(ts["stock_symbol"]):
-            actual_stock_qty = self.Portfolio[ts["stock_symbol"]].Quantity
-
-        if actual_stock_qty != 0:
-            self._filling_ticker = ticker
-            self.MarketOrder(ts["stock_symbol"], -actual_stock_qty)
-            self._filling_ticker = None
-
-        # ── Buy back short put if still open ─────────────────────────
-        if ts.get("short_put_symbol"):
-            short_qty = 0
-            if self.Portfolio.ContainsKey(ts["short_put_symbol"]):
-                short_qty = self.Portfolio[ts["short_put_symbol"]].Quantity
-            if short_qty != 0:
-                self._filling_ticker = ticker
-                self.MarketOrder(ts["short_put_symbol"], -short_qty)
-                self._filling_ticker = None
-
-        # ── P&L calculation ─────────────────────────────────────────
-        n_contracts = ts["put_contracts"]
-        long_pnl  = (ts["put_exit_fill"] - ts["put_entry_fill"]) * n_contracts * 100
-        short_pnl = (ts["short_put_entry_fill"] - ts["short_put_exit_fill"]) * n_contracts * 100
-        stk_pnl   = ts["stock_realized"]
-        total     = long_pnl + short_pnl + stk_pnl
-
-        self._log(f"  [{self.Time.date()}]  LongPnL=${long_pnl:+,.2f} "
-                 f"ShortPnL=${short_pnl:+,.2f} StkPnL=${stk_pnl:+,.2f} "
-                 f"Total=${total:+,.2f}")
-
-        # Stock % change
-        entry_px = ts["stock_entry_price"]
-        exit_px  = self.Securities[ts["stock_symbol"]].Price if entry_px > 0 else 0.0
-        stk_chg_pct = ((exit_px - entry_px) / entry_px * 100) if entry_px > 0 else 0.0
-
-        ed = ts["entry_earnings"].date() if ts["entry_earnings"] else self.Time.date()
-
-        _short_iv = ts["short_put_entry_iv"]
-        _long_iv  = ts["put_entry_iv"]
-        _rv       = ts["entry_rv"]
-
-        ts["trade_log"].append({
-            "earnings":           ed,
-            "n_contracts":        n_contracts,
-            "long_pnl":           long_pnl,
-            "short_pnl":          short_pnl,
-            "stk_pnl":            stk_pnl,
-            "stk_chg_pct":        stk_chg_pct,
-            "total":              total,
-            "iv_entry":           _long_iv,
-            "iv_exit":            0.0,
-            "rv":                 _rv,
-            "iv_spread_entry":    _long_iv - _short_iv,
-            "short_iv_entry":     _short_iv,
-            "short_iv_rv":        _short_iv / _rv if _rv > 0 else 0.0,
-            "long_spread_entry":  ts["long_spread_entry"],
-            "short_spread_entry": ts["short_spread_entry"],
-            "long_spread_exit":   0,
-            "short_spread_exit":  0,
-        })
-        ts["traded_earnings"].add(ed)
-        self._reset(ticker)
-
-    # ── Hourly orphan check ──────────────────────────────────────────────────
-
-    def _check_orphaned_positions(self, ticker):
-        """Hourly safety net:
-        1. ACTIVE state — if we hold long put but NOT short put → short was assigned.
-        2. FLAT state — if stock is lingering from a previous assignment delivery
-           that arrived after _immediate_close_all already reset state → sell it."""
-        ts = self._ts[ticker]
-
-        # ── FLAT-state cleanup: sell orphaned assignment stock ──────────
-        if ts["state"] == "FLAT":
-            # Once we've already cleaned up orphan stock for this cycle, don't
-            # repeat — corporate actions (spinoffs, etc.) can keep delivering
-            # new shares, and each repeat would double the P&L correction.
-            if ts.get("orphan_cleaned"):
-                return
-
-            stk_qty = 0
-            try:
-                if self.Portfolio.ContainsKey(ts["stock_symbol"]):
-                    stk_qty = self.Portfolio[ts["stock_symbol"]].Quantity
-            except Exception:
-                stk_qty = 0
-            if stk_qty != 0:
-                sell_price = self.Securities[ts["stock_symbol"]].Price
-                self._log(f"  [{self.Time.date()}] ORPHAN STOCK (FLAT) for {ticker}: "
-                         f"{stk_qty} shares at ${sell_price:.2f} — selling immediately")
-                self._filling_ticker = ticker
-                self.MarketOrder(ts["stock_symbol"], -stk_qty)
-                self._filling_ticker = None
-
-                # Mark as cleaned so we don't repeat this for the same cycle
-                ts["orphan_cleaned"] = True
-
-                # ── Record the assignment stock P&L as a correction to
-                #    the last trade_log entry (written by _immediate_close_all
-                #    before the assignment stock arrived) ──────────────────
-                if ts["trade_log"]:
-                    last = ts["trade_log"][-1]
-                    # Assignment stock was bought at strike; we're selling at market
-                    # stk_qty is positive for long stock (put assignment delivers long)
-                    # The fill price in OnOrderEvent was ignored (FLAT state),
-                    # so estimate: bought at strike, sold at current market.
-                    assign_strike = last.get("_assign_strike", 0.0)
-                    if assign_strike > 0:
-                        assign_loss = (sell_price - assign_strike) * abs(stk_qty)
-                    else:
-                        assign_loss = 0.0
-                    last["stk_pnl"]  += assign_loss
-                    last["total"]    += assign_loss
-                    self._log(f"  [{self.Time.date()}] ORPHAN P&L correction: "
-                             f"assign_strike=${assign_strike:.2f} "
-                             f"sell_price=${sell_price:.2f} "
-                             f"shares={abs(stk_qty)} "
-                             f"loss=${assign_loss:+,.2f} "
-                             f"new_total=${last['total']:+,.2f}")
-            return
-
-        if ts["state"] != "ACTIVE":
-            return
-
-        put_sym   = ts.get("put_symbol")
-        short_sym = ts.get("short_put_symbol")
-        if not put_sym or not short_sym:
-            return
-
-        # Read actual portfolio quantities
-        long_qty  = 0
-        short_qty = 0
-        stk_qty   = 0
-        try:
-            if self.Portfolio.ContainsKey(put_sym):
-                long_qty = self.Portfolio[put_sym].Quantity
-        except Exception:
-            long_qty = 0
-        try:
-            if self.Portfolio.ContainsKey(short_sym):
-                short_qty = self.Portfolio[short_sym].Quantity
-        except Exception:
-            short_qty = 0
-        try:
-            if self.Portfolio.ContainsKey(ts["stock_symbol"]):
-                stk_qty = self.Portfolio[ts["stock_symbol"]].Quantity
-        except Exception:
-            stk_qty = 0
-
-        # Orphan condition: we hold long put but short put is gone (assigned away)
-        if long_qty > 0 and short_qty == 0:
-            self._log(f"  [{self.Time.date()}] ORPHAN DETECTED for {ticker}: "
-                     f"long_qty={long_qty}, short_qty={short_qty}, stk_qty={stk_qty} "
-                     f"— closing all positions")
-
-            ts["force_exited"] = True
-            self._filling_ticker = ticker
-
-            # Close long put
-            self.MarketOrder(put_sym, -long_qty)
-
-            # Close stock (could be hedge stock + assignment-delivered stock)
-            if stk_qty != 0:
-                self.MarketOrder(ts["stock_symbol"], -stk_qty)
-
-            self._filling_ticker = None
-
-            # P&L from actual fills
-            n_contracts = ts["put_contracts"]
-            long_pnl  = (ts["put_exit_fill"] - ts["put_entry_fill"]) * n_contracts * 100
-            short_pnl = (ts["short_put_entry_fill"] - ts["short_put_exit_fill"]) * n_contracts * 100
-            stk_pnl   = ts["stock_realized"]
-            total     = long_pnl + short_pnl + stk_pnl
-
-            self._log(f"  [{self.Time.date()}] ORPHAN CLEANUP: "
-                     f"LongPnL=${long_pnl:+,.2f} ShortPnL=${short_pnl:+,.2f} "
-                     f"StkPnL=${stk_pnl:+,.2f} Total=${total:+,.2f}")
-
-            # Stock % change
-            entry_px = ts["stock_entry_price"]
-            exit_px  = self.Securities[ts["stock_symbol"]].Price if entry_px > 0 else 0.0
-            stk_chg_pct = ((exit_px - entry_px) / entry_px * 100) if entry_px > 0 else 0.0
-
-            ed = ts["entry_earnings"].date() if ts["entry_earnings"] else self.Time.date()
-
-            _short_iv = ts["short_put_entry_iv"]
-            _long_iv  = ts["put_entry_iv"]
-            _rv       = ts["entry_rv"]
-
-            ts["trade_log"].append({
-                "earnings":           ed,
-                "n_contracts":        n_contracts,
-                "long_pnl":           long_pnl,
-                "short_pnl":          short_pnl,
-                "stk_pnl":            stk_pnl,
-                "stk_chg_pct":        stk_chg_pct,
-                "total":              total,
-                "iv_entry":           _long_iv,
-                "iv_exit":            0.0,
-                "rv":                 _rv,
-                "iv_spread_entry":    _long_iv - _short_iv,
-                "short_iv_entry":     _short_iv,
-                "short_iv_rv":        _short_iv / _rv if _rv > 0 else 0.0,
-                "long_spread_entry":  ts["long_spread_entry"],
-                "short_spread_entry": ts["short_spread_entry"],
-                "long_spread_exit":   0,
-                "short_spread_exit":  0,
-            })
-            ts["traded_earnings"].add(ed)
-            self._reset(ticker)
-
     def _reset(self, ticker):
         ts = self._ts[ticker]
         ts["state"]               = "FLAT"
@@ -1235,6 +886,8 @@ class EarningsCalendarPutMultiTicker(QCAlgorithm):
         ts["entry_earnings"]      = None
         ts["entry_rv"]            = 0.0
         ts["force_exited"]        = False
+        ts["_closing_forced"]     = False
+        ts["hedge_count"]         = 0
         # Note: orphan_cleaned is NOT reset here — it stays True until
         # _enter_position clears it, preventing repeated cleanup in FLAT state.
         ts["total_fees"]          = 0.0
@@ -1261,6 +914,7 @@ class EarningsCalendarPutMultiTicker(QCAlgorithm):
         grand_total = 0.0
         grand_trades = 0
         grand_wins   = 0
+        grand_hedges = 0
         grand_attempts   = 0
         grand_no_pair    = 0
         grand_low_debit  = 0
@@ -1338,6 +992,7 @@ class EarningsCalendarPutMultiTicker(QCAlgorithm):
                 _sse = t.get("short_spread_entry", 0)
                 _lsx = t.get("long_spread_exit", 0)
                 _ssx = t.get("short_spread_exit", 0)
+                _hcnt = t.get("hedge_count", 0)
                 self._ol(lines,
                     f"  {tag} {t['earnings']!s:<11}"
                     f"  {nc:>5}"
@@ -1356,6 +1011,7 @@ class EarningsCalendarPutMultiTicker(QCAlgorithm):
                     f"  {_sse:>7}"
                     f"  {_lsx:>7}"
                     f"  {_ssx:>7}"
+                    f"  Hdg={_hcnt}"
                 )
                 totals["long"]  += t["long_pnl"]
                 totals["short"] += t["short_pnl"]
@@ -1373,15 +1029,19 @@ class EarningsCalendarPutMultiTicker(QCAlgorithm):
                 f"  {'':>9}"
                 f"  ${totals['total']:>+10,.2f}"
             )
-            self._ol(lines, f"  Avg PnL/trade: ${avg:+,.2f}")
+            ticker_hedges = sum(t.get("hedge_count", 0) for t in valid)
+            avg_hedges = ticker_hedges / printed if printed > 0 else 0.0
+            self._ol(lines, f"  Avg PnL/trade: ${avg:+,.2f}  |  Hedges: {ticker_hedges} total, {avg_hedges:.1f} avg/trade")
             self._ol(lines, f"{'='*80}")
-            grand_total += totals["total"]
+            grand_total  += totals["total"]
+            grand_hedges += ticker_hedges
 
         if len(self._ts) > 1:
             grand_skipped = grand_no_pair + grand_low_debit + grand_other_skip
             self._ol(lines, f"{'='*80}")
             self._ol(lines, f"  ALL TICKERS COMBINED  |  {grand_trades} trade(s)  |  Wins: {grand_wins}/{grand_trades}  |  Max concurrent positions: {self._max_concurrent}")
-            self._ol(lines, f"  Combined PnL: ${grand_total:+,.2f}  |  Avg PnL/trade: ${grand_total / grand_trades:+,.2f}" if grand_trades else f"  Combined PnL: ${grand_total:+,.2f}")
+            avg_h = grand_hedges / grand_trades if grand_trades else 0.0
+            self._ol(lines, f"  Combined PnL: ${grand_total:+,.2f}  |  Avg PnL/trade: ${grand_total / grand_trades:+,.2f}  |  Hedges: {grand_hedges} total, {avg_h:.1f} avg/trade" if grand_trades else f"  Combined PnL: ${grand_total:+,.2f}")
             self._ol(lines, f"  Total Fees:   ${self._total_fees:,.2f}  |  PnL net of fees: ${grand_total - self._total_fees:+,.2f}")
             self._ol(lines, f"  SKIP TOTALS: {grand_attempts} attempted | {grand_trades} traded | {grand_skipped} skipped (no_pair={grand_no_pair}, low_debit={grand_low_debit}, other={grand_other_skip})")
             self._ol(lines, f"{'='*80}")

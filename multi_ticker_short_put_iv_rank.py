@@ -20,8 +20,18 @@ MIN_DTE_EXIT = 5         # Close position if put has <= this many trading days u
 IV_ROLLBACK_RATIO = 0    # If selected put IV / prior-week put IV > this, sell the prior-week put instead (0 = disabled)
 
 S      = 10_000          # Notional USD value of puts to sell at entry (per ticker)
-D_mult  = 1.0            # Delta-tolerance scalar: tolerance = D_mult × daily_sigma_frac × |option_exposure|
-RV_SIGMA = False         # True → hedge tolerance from 30d RV; False → from put's live IV (chain); fallback entry IV if IV missing
+HEDGE_MODE = "theta"     # "gamma" → fixed PnL-tolerance trigger (ΔS = √(2·tol/Γ))
+                         # "theta" → theta-scaled PnL trigger (tol = THETA_K × |daily θ|)
+                         # "sigma" → original vol-scaled delta tolerance
+PNL_TOLERANCE = 100      # (gamma mode) Dollar P&L threshold per position before re-hedging
+THETA_K       = 1.0      # (theta mode) Scalar on daily theta: tol = THETA_K × |θ_daily_position|
+                         # 1.0 = re-hedge at the theta-gamma breakeven move
+                         # <1  = tighter (hedge before breakeven)  >1 = looser
+MIN_TOLERANCE = 50       # (theta mode) Floor on dynamic tolerance to guard against near-zero theta
+DRIFT_FLOOR   = 0.10     # (gamma/theta mode) Max |position_delta| as fraction of option exposure
+                         # Catches time-decay drift when stock is flat (0.10 = 10%)
+D_mult  = 1.0            # (sigma mode) tolerance = D_mult × daily_sigma_frac × |option_exposure|
+RV_SIGMA = False          # (sigma mode) True → hedge tolerance from 30d RV; False → from put's live IV
 MAX_PUT_PCT = 0.15       # Skip entry if put_mid > stock_price × MAX_PUT_PCT
 SPREAD_CUTOFF_PCT = 0.20 # Max bid-ask spread as fraction of option mid price (0 = disabled)
 PRICE_MODEL = "default"  # "BT" | "BS" | "default"
@@ -122,6 +132,7 @@ class ShortPutIVRankAlgo(QCAlgorithm):
                 "earnings_dates":   earnings,
                 "trade_log":        [],
                 "force_exited":     False,
+                "hedge_count":      0,
                 "put_spread_entry": 0,
                 "put_spread_exit":  0,
                 "vix_entry":        None,
@@ -257,6 +268,7 @@ class ShortPutIVRankAlgo(QCAlgorithm):
                             "vix_exit":         ts["vix_exit"],
                             "entry_iv_pctl":    ts["entry_iv_pctl"],
                             "exit_iv_pctl":     ts["exit_iv_pctl"],
+                            "hedge_count":      ts["hedge_count"],
                         })
                         self.Log(f"  [{self.Time.date()}] FORCED EXIT FINALIZED: "
                                  f"{ticker} put=${fill_price:.2f} "
@@ -632,6 +644,7 @@ class ShortPutIVRankAlgo(QCAlgorithm):
             "vix_exit":         ts["vix_exit"],
             "entry_iv_pctl":    ts["entry_iv_pctl"],
             "exit_iv_pctl":     ts["exit_iv_pctl"],
+            "hedge_count":      ts["hedge_count"],
         })
         self._reset(ticker)
 
@@ -698,31 +711,62 @@ class ShortPutIVRankAlgo(QCAlgorithm):
 
         position_delta = stock_delta + option_delta
 
-        # ── Daily sigma fraction ──────────────────────────────────────
-        if RV_SIGMA:
-            rv = self._calc_realized_vol(ts["stock_symbol"], 30)
-            if rv <= 0:
-                return
-            daily_sigma_frac = rv / (252 ** 0.5)
-        else:
-            sigma_iv = cur_iv if cur_iv > 0 else ts["put_entry_iv"]
-            if sigma_iv <= 0:
-                return
-            daily_sigma_frac = sigma_iv / (252 ** 0.5)
-
-        # ── Tolerance ─────────────────────────────────────────────────
+        # ── Hedge trigger ──────────────────────────────────────────────
         option_exposure = abs(ts["put_contracts"] * 100)
-        tolerance = D_mult * daily_sigma_frac * option_exposure
 
-        if abs(position_delta) <= tolerance:
-            if DEBUG:
-                strike = ts["put_symbol"].ID.StrikePrice
-                self.Log(f"  [{self.Time.date()}] [{ticker}] HEDGE SKIP "
-                         f"stk=${s_price:.2f} K=${strike:.0f} "
-                         f"delta={cur_delta:.4f} gamma={cur_gamma:.4f} "
-                         f"theta={cur_theta:.2f} IV={cur_iv:.1%} "
-                         f"posDelta={position_delta:.1f} tol={tolerance:.1f}")
-            return
+        if HEDGE_MODE in ("gamma", "theta"):
+            if HEDGE_MODE == "theta":
+                daily_theta_pos = abs(cur_theta * ts["put_contracts"] * 100) / 365.0 if cur_theta else 0.0
+                pnl_tol = max(THETA_K * daily_theta_pos, MIN_TOLERANCE)
+            else:
+                pnl_tol = PNL_TOLERANCE
+
+            total_gamma = abs(cur_gamma * ts["put_contracts"] * 100) if cur_gamma else 0.0
+
+            if total_gamma <= 1e-10:
+                if abs(position_delta) <= 1:
+                    return
+            else:
+                delta_s_trigger = (2.0 * pnl_tol / total_gamma) ** 0.5
+                stock_move = abs(s_price - ts["last_hedge_price"])
+
+                max_drift = DRIFT_FLOOR * option_exposure
+                if abs(position_delta) > max_drift:
+                    pass  # fall through to hedge
+                elif stock_move < delta_s_trigger:
+                    if DEBUG:
+                        strike = ts["put_symbol"].ID.StrikePrice
+                        self.Log(f"  [{self.Time.date()}] [{ticker}] HEDGE SKIP "
+                                 f"stk=${s_price:.2f} K=${strike:.0f} "
+                                 f"delta={cur_delta:.4f} gamma={cur_gamma:.4f} "
+                                 f"theta={cur_theta:.2f} IV={cur_iv:.1%} "
+                                 f"posDelta={position_delta:.1f} "
+                                 f"ΔS={stock_move:.2f} trigger={delta_s_trigger:.2f} "
+                                 f"pnl_tol={pnl_tol:.1f}")
+                    return
+
+        else:
+            if RV_SIGMA:
+                rv = self._calc_realized_vol(ts["stock_symbol"], 30)
+                if rv <= 0:
+                    return
+                daily_sigma_frac = rv / (252 ** 0.5)
+            else:
+                sigma_iv = cur_iv if cur_iv > 0 else ts["put_entry_iv"]
+                if sigma_iv <= 0:
+                    return
+                daily_sigma_frac = sigma_iv / (252 ** 0.5)
+
+            tolerance = D_mult * daily_sigma_frac * option_exposure
+            if abs(position_delta) <= tolerance:
+                if DEBUG:
+                    strike = ts["put_symbol"].ID.StrikePrice
+                    self.Log(f"  [{self.Time.date()}] [{ticker}] HEDGE SKIP "
+                             f"stk=${s_price:.2f} K=${strike:.0f} "
+                             f"delta={cur_delta:.4f} gamma={cur_gamma:.4f} "
+                             f"theta={cur_theta:.2f} IV={cur_iv:.1%} "
+                             f"posDelta={position_delta:.1f} tol={tolerance:.1f}")
+                return
 
         # Target: stock qty should offset option delta → stock_target = -option_delta
         target = int(-round(option_delta))
@@ -732,17 +776,19 @@ class ShortPutIVRankAlgo(QCAlgorithm):
 
         if DEBUG:
             strike = ts["put_symbol"].ID.StrikePrice
+            _tol_s = f"pnl_tol={pnl_tol:.1f}" if HEDGE_MODE in ("gamma", "theta") else f"tol={tolerance:.1f}"
             self.Log(f"  [{self.Time.date()}] [{ticker}] HEDGE adj={adj:+d} "
                      f"stk=${s_price:.2f} K=${strike:.0f} "
                      f"delta={cur_delta:.4f} gamma={cur_gamma:.4f} "
                      f"theta={cur_theta:.2f} IV={cur_iv:.1%} "
-                     f"posDelta={position_delta:.1f} tol={tolerance:.1f} "
+                     f"posDelta={position_delta:.1f} {_tol_s} "
                      f"stk_qty={ts['stock_qty']}→{target}")
 
         self._filling_ticker = ticker
         self.MarketOrder(ts["stock_symbol"], adj)
         self._filling_ticker = None
 
+        ts["hedge_count"] += 1
         ts["last_hedge_price"] = s_price
 
     # ── Helpers ───────────────────────────────────────────────────────────────
@@ -916,6 +962,7 @@ class ShortPutIVRankAlgo(QCAlgorithm):
             "vix_exit":         ts["vix_exit"],
             "entry_iv_pctl":    ts["entry_iv_pctl"],
             "exit_iv_pctl":     ts["exit_iv_pctl"],
+            "hedge_count":      ts["hedge_count"],
         })
         self._reset(ticker)
 
@@ -940,6 +987,7 @@ class ShortPutIVRankAlgo(QCAlgorithm):
         ts["iv_trade_min"]      = None
         ts["iv_trade_max"]      = None
         ts["force_exited"]      = False
+        ts["hedge_count"]       = 0
         ts["put_spread_entry"]  = 0
         ts["put_spread_exit"]   = 0
         ts["vix_entry"]         = None
@@ -999,6 +1047,7 @@ class ShortPutIVRankAlgo(QCAlgorithm):
                 _pivEx = t.get("exit_iv_pctl")
                 _pivEn_s = f"{_pivEn:.0f}" if _pivEn is not None else "n/a"
                 _pivEx_s = f"{_pivEx:.0f}" if _pivEx is not None else "n/a"
+                _hcnt = t.get("hedge_count", 0)
                 self._ol(lines,
                     f"  {tag} {t['entry_date']!s:<11} {t['exit_date']!s:<11} days={t['held_days']}"
                     f"  PutPnL={D}{t['put_pnl']:>+,.0f}"
@@ -1013,6 +1062,7 @@ class ShortPutIVRankAlgo(QCAlgorithm):
                     f"  TrMin={_tmin:.1%} TrMax={_tmax:.1%}"
                     f"  HMin={_hmin:.1%} HMax={_hmax:.1%}"
                     f"  SpEn={_pse} SpEx={_psx}"
+                    f"  Hdg={_hcnt}"
                 )
                 totals["put"]   += t["put_pnl"]
                 totals["stk"]   += t["stk_pnl"]

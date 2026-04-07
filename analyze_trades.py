@@ -5,7 +5,7 @@ Bucket analysis of parsed trade CSV.
 Usage:
     python analyze_trades.py <input.csv> <output.txt>
 
-Runs seven analyses (all using sim_pnl as the PnL metric):
+Runs eight analyses (all using sim_pnl as the PnL metric):
   A. IV Percentile at Entry (perc_iv_en) vs sim_pnl
   B. IV/RV Ratio (iv_rv) vs sim_pnl
   C. IV Rank at Entry (ivr) vs sim_pnl
@@ -13,8 +13,9 @@ Runs seven analyses (all using sim_pnl as the PnL metric):
   E. IV at Entry Sample (iv_enter_sample) vs sim_pnl
   F. IV at Entry (iv_entry) vs sim_pnl  [quartile buckets]
   G. Per-Ticker IV % Increase (iv_entry -> iv_exit)
+  H. Monthly PnL (filtered: IV/RV < 1.5 and VIX < 24)
 """
-import csv, statistics, argparse
+import csv, statistics, argparse, re
 from collections import defaultdict
 
 
@@ -321,6 +322,83 @@ def main():
             out.write(f"  {'OVERALL':<8} {len(all_pcts):>6} {overall_avg:>+17.1f}% {overall_med:>+9.1f}% {overall_pnl:>+12,.2f} {overall_ivrv:>10.2f}\n")
             avg_of_avgs = sum(sum(v) / len(v) for v in ticker_pcts.values()) / len(ticker_pcts)
             out.write(f"\n  Avg of per-ticker avgs (equal-weight): {avg_of_avgs:+.1f}%\n")
+
+        out.write("\n")
+
+        # ── Section H: Monthly PnL (IV/RV < 1.5 and VIX < 24) ─────────────
+        out.write("=" * 80 + "\n")
+        out.write("H. MONTHLY PnL  (filtered: IV/RV < 1.5 AND VIX at entry < 24)\n")
+        out.write("=" * 80 + "\n\n")
+
+        MONTH_NAMES = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                       "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+        monthly_data = defaultdict(lambda: {"pnl": 0.0, "trades": 0, "wins": 0})
+        monthly_skipped = 0
+
+        for r in csv_rows:
+            try:
+                ivrv = float(r.get("iv_rv", "").strip())
+                vix = float(r.get("vix_entry", "").strip())
+                pnl = float(r.get("sim_pnl", "").strip().replace(",", "").replace("+", ""))
+                earnings_str = r.get("earnings", "").strip()
+                ym_match = re.match(r"(\d{4})-(\d{2})", earnings_str)
+                if not ym_match:
+                    monthly_skipped += 1
+                    continue
+                if ivrv < 1.5 and vix < 24:
+                    ym_key = ym_match.group(0)
+                    monthly_data[ym_key]["pnl"] += pnl
+                    monthly_data[ym_key]["trades"] += 1
+                    if r.get("win", "").strip() == "Win":
+                        monthly_data[ym_key]["wins"] += 1
+            except Exception:
+                monthly_skipped += 1
+
+        if monthly_data:
+            all_yms = sorted(monthly_data.keys())
+            first_year = int(all_yms[0][:4])
+            last_year = int(all_yms[-1][:4])
+
+            hdr_h = f"  {'Month':<12} {'Trades':>6} {'Wins':>5} {'Win%':>6} {'Avg PnL':>10} {'Total PnL':>12} {'Cumulative':>12}"
+            out.write(hdr_h + "\n")
+            out.write("  " + "-" * (len(hdr_h) - 2) + "\n")
+
+            cumulative = 0.0
+            total_trades_h = 0
+            total_wins_h = 0
+            total_pnl_h = 0.0
+
+            for year in range(first_year, last_year + 1):
+                for month in range(1, 13):
+                    ym = f"{year}-{month:02d}"
+                    label = f"{year} {MONTH_NAMES[month - 1]}"
+                    d = monthly_data.get(ym)
+                    if d and d["trades"] > 0:
+                        cumulative += d["pnl"]
+                        total_trades_h += d["trades"]
+                        total_wins_h += d["wins"]
+                        total_pnl_h += d["pnl"]
+                        win_pct = d["wins"] / d["trades"] * 100
+                        avg_pnl = d["pnl"] / d["trades"]
+                        out.write(
+                            f"  {label:<12} {d['trades']:>6} {d['wins']:>5} "
+                            f"{win_pct:>5.1f}% {avg_pnl:>+10,.0f} "
+                            f"{d['pnl']:>+12,.0f} {cumulative:>+12,.0f}\n"
+                        )
+                    else:
+                        out.write(f"  {label:<12} {'0':>6}\n")
+
+            out.write("  " + "-" * (len(hdr_h) - 2) + "\n")
+            if total_trades_h > 0:
+                overall_win_pct = total_wins_h / total_trades_h * 100
+                overall_avg = total_pnl_h / total_trades_h
+                out.write(
+                    f"  {'TOTAL':<12} {total_trades_h:>6} {total_wins_h:>5} "
+                    f"{overall_win_pct:>5.1f}% {overall_avg:>+10,.0f} "
+                    f"{total_pnl_h:>+12,.0f} {cumulative:>+12,.0f}\n"
+                )
+        else:
+            out.write("  (no valid data for monthly PnL — need iv_rv, vix_entry, sim_pnl, earnings columns)\n")
 
         out.write("\n")
 

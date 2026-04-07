@@ -6,7 +6,9 @@ import requests
 
 # Ensure import * exports underscore-prefixed names too
 __all__ = [
-    "N", "K", "S", "MIN_NET_DEBIT", "SPREAD_CUTOFF_PCT", "DELTA_HEDGE", "D_mult", "RV_SIGMA", "Z",
+    "N", "K", "S", "MIN_NET_DEBIT", "SPREAD_CUTOFF_PCT", "DELTA_HEDGE",
+    "HEDGE_MODE", "PNL_TOLERANCE", "THETA_K", "MIN_TOLERANCE", "DRIFT_FLOOR",
+    "D_mult", "RV_SIGMA", "Z",
     "MAX_PUT_PCT", "PUT_LIMIT_MULT", "MAX_SPREAD_DAYS", "PRICE_MODEL",
     "HOURLY_BARS", "TRADE_TIME_MIN", "HEDGE_TIME_MIN", "EXIT_DAYS_BEFORE",
     "FMP_API_KEY", "MANUAL_EARNINGS_DATES",
@@ -24,10 +26,15 @@ MIN_NET_DEBIT = 0.75   # Skip trade if long_mid - short_mid < this (dollars)
 SPREAD_CUTOFF_PCT = 0.0   # Max bid-ask spread as fraction of option mid price (0.20 = 20%)
                           # Skip entry if either leg exceeds this.  0 = disabled.
 DELTA_HEDGE = True   # True → delta-hedge with stock daily;  False → no stock hedging
-D_mult  = 1.0    # Delta-tolerance scalar: tolerance = D_mult × daily_sigma_frac × |option_exposure|
-                  # e.g. 1.0 → tolerate up to 1 daily-sigma of delta drift before re-hedging
-RV_SIGMA = True   # True  → hedge tolerance sigma from live 30-day realized vol (refreshed daily)
-                  # False → hedge tolerance sigma from long put's live IV (fallback: entry IV)
+HEDGE_MODE    = "theta"  # "gamma" → fixed PnL-tolerance trigger (ΔS = √(2·tol/Γ))
+                         # "theta" → theta-scaled PnL trigger (tol = THETA_K × |daily θ|)
+                         # "sigma" → original vol-scaled delta tolerance
+PNL_TOLERANCE = 100      # (gamma mode) Dollar P&L threshold per position before re-hedging
+THETA_K       = 1.0      # (theta mode) Scalar on daily theta: tol = THETA_K × |θ_daily_position|
+MIN_TOLERANCE = 50       # (theta mode) Floor on dynamic tolerance to guard against near-zero theta
+DRIFT_FLOOR   = 0.10     # (gamma/theta) Max |position_delta| as fraction of option exposure (0.10 = 10%)
+D_mult  = 1.0    # (sigma mode) tolerance = D_mult × daily_sigma_frac × |option_exposure|
+RV_SIGMA = True   # (sigma mode) True → 30d realized vol; False → long put's live IV
 Z      = 0.0      # IV/RV filter: skip entry if IV/RV >= Z  (0.0 = disabled)
 MAX_PUT_PCT = 0.15  # Sanity: skip entry if long_put_mid > stock_price × MAX_PUT_PCT
 PUT_LIMIT_MULT = 1.2  # Limit order for long put at long_mid × this (prevents bad fills)
@@ -90,35 +97,35 @@ def _mid(bid, ask):
 
 class NullAssignmentModel(DefaultOptionAssignmentModel):
     """Never trigger automatic option assignment — the algo manages all exits."""
-    def GetAssignment(self, parameters):
-        return OptionAssignmentResult.Null
+    def get_assignment(self, parameters):
+        return OptionAssignmentResult.NULL
 
 
 class MidPriceFillModel(ImmediateFillModel):
-    def MarketFill(self, asset, order):
-        fill = ImmediateFillModel.MarketFill(self, asset, order)
-        mid  = _mid(asset.BidPrice, asset.AskPrice)
+    def market_fill(self, asset, order):
+        fill = super().market_fill(asset, order)
+        mid  = _mid(asset.bid_price, asset.ask_price)
         if mid > 0:
-            fill.FillPrice = round(mid, 2)
+            fill.fill_price = round(mid, 2)
         return fill
 
-    def LimitFill(self, asset, order):
-        mid = _mid(asset.BidPrice, asset.AskPrice)
+    def limit_fill(self, asset, order):
+        mid = _mid(asset.bid_price, asset.ask_price)
         if mid <= 0:
-            return super().LimitFill(asset, order)
-        _no_fill = getattr(OrderStatus, 'None')   # avoid Python keyword
+            return super().limit_fill(asset, order)
+        _no_fill = OrderStatus.NONE
         # Buy limit: fill at mid only if mid <= limit price
-        if order.Quantity > 0 and mid > order.LimitPrice:
-            return OrderEvent(order.Id, order.Symbol, asset.LocalTime,
-                              _no_fill, order.Direction,
-                              0, 0, OrderFee.Zero, "mid above limit")
+        if order.quantity > 0 and mid > order.limit_price:
+            return OrderEvent(order.id, order.symbol, asset.local_time,
+                              _no_fill, order.direction,
+                              0, 0, OrderFee.ZERO, "mid above limit")
         # Sell limit: fill at mid only if mid >= limit price
-        if order.Quantity < 0 and mid < order.LimitPrice:
-            return OrderEvent(order.Id, order.Symbol, asset.LocalTime,
-                              _no_fill, order.Direction,
-                              0, 0, OrderFee.Zero, "mid below limit")
+        if order.quantity < 0 and mid < order.limit_price:
+            return OrderEvent(order.id, order.symbol, asset.local_time,
+                              _no_fill, order.direction,
+                              0, 0, OrderFee.ZERO, "mid below limit")
         # Condition met — fill at mid
-        fill = super().LimitFill(asset, order)
-        if fill.Status == OrderStatus.Filled:
-            fill.FillPrice = round(mid, 2)
+        fill = super().limit_fill(asset, order)
+        if fill.status == OrderStatus.FILLED:
+            fill.fill_price = round(mid, 2)
         return fill
