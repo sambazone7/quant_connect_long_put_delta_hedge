@@ -9,7 +9,7 @@ __all__ = [
     "N", "K", "S", "MIN_NET_DEBIT", "SPREAD_CUTOFF_PCT", "DELTA_HEDGE",
     "HEDGE_MODE", "PNL_TOLERANCE", "THETA_K", "MIN_TOLERANCE", "DRIFT_FLOOR",
     "D_mult", "RV_SIGMA", "Z",
-    "MAX_PUT_PCT", "PUT_LIMIT_MULT", "MAX_SPREAD_DAYS", "PRICE_MODEL",
+    "MAX_PUT_PCT", "PUT_LIMIT_MULT", "N_WEEKLY_AFTER_EARNINGS", "MAX_SHORT_EARN_DAYS", "PRICE_MODEL",
     "HOURLY_BARS", "TRADE_TIME_MIN", "HEDGE_TIME_MIN", "EXIT_DAYS_BEFORE",
     "FMP_API_KEY", "MANUAL_EARNINGS_DATES",
     "_fetch_earnings_fmp", "_mid",
@@ -38,8 +38,10 @@ RV_SIGMA = True   # (sigma mode) True → 30d realized vol; False → long put's
 Z      = 0.0      # IV/RV filter: skip entry if IV/RV >= Z  (0.0 = disabled)
 MAX_PUT_PCT = 0.15  # Sanity: skip entry if long_put_mid > stock_price × MAX_PUT_PCT
 PUT_LIMIT_MULT = 1.2  # Limit order for long put at long_mid × this (prevents bad fills)
-MAX_SPREAD_DAYS = 7   # Max calendar days between short and long put expirations
-                      # If wider → skip trade (no weekly expirations available)
+N_WEEKLY_AFTER_EARNINGS = 1  # Which weekly expiry after earnings for the long put:
+                             # 1 → first weekly after earnings, 2 → second weekly, etc.
+MAX_SHORT_EARN_DAYS = 7      # Max calendar days between short put expiry and earnings date
+                             # If short expiry is further than this from earnings → skip trade
 PRICE_MODEL = "default"   # Option pricing model for Greeks: "BT" | "BS" | "default"
                           # BT  = Binomial CoxRossRubinstein (American equity options — recommended)
                           # BS  = Black-Scholes (European-style, faster, ignores early exercise)

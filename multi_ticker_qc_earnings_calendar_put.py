@@ -20,9 +20,9 @@ class EarningsCalendarPutMultiTicker(QCAlgorithm):
     # ── Initialise ────────────────────────────────────────────────────────────
 
     def Initialize(self):
-        self.SetStartDate(2022, 1, 1)
+        self.SetStartDate(2020, 1, 1)
         self.SetEndDate(2026, 2, 20)
-        self.SetCash(20_000_000)
+        self.SetCash(5_000_000)
 
         tickers = list(MANUAL_EARNINGS_DATES.keys())
 
@@ -32,6 +32,7 @@ class EarningsCalendarPutMultiTicker(QCAlgorithm):
         self._all_lines = []       # collect ALL log lines for ObjectStore
         self._filling_ticker = None  # set around our own orders to distinguish from auto-liquidation
         self._total_fees = 0.0     # accumulated fees across all tickers and orders
+        self._vix_symbol = self.AddData(CBOE, "VIX", Resolution.Daily).Symbol
 
         _exp_max = K * 2 + 20   # broad enough to capture weeklies around earnings
 
@@ -57,6 +58,8 @@ class EarningsCalendarPutMultiTicker(QCAlgorithm):
                 "state":                "FLAT",
                 "put_symbol":           None,     # long put (buy)
                 "short_put_symbol":     None,     # short put (sell)
+                "call_symbol_long":    None,     # call at long put strike/expiry (for sim PnL)
+                "call_symbol_short":   None,     # call at short put strike/expiry (for sim PnL)
                 "put_contracts":        0,        # same qty for both legs
                 "put_entry_fill":       0.0,      # long put entry fill
                 "put_exit_fill":        0.0,      # long put exit fill
@@ -74,6 +77,8 @@ class EarningsCalendarPutMultiTicker(QCAlgorithm):
                 "last_hedge_price":     0.0,
                 "entry_earnings":       None,
                 "entry_rv":             0.0,
+                "vix_entry":           None,
+                "vix_exit":            None,
                 # chain cache
                 "chain": None,
                 # data
@@ -364,20 +369,21 @@ class EarningsCalendarPutMultiTicker(QCAlgorithm):
         """Select a calendar put pair: same strike, short expiry before
         earnings and long expiry after earnings.
 
-        Tries all strikes from ATM downward (highest ≤ stock_price first).
+        Short put: closest expiry before earnings (must be within MAX_SHORT_EARN_DAYS).
+        Long put:  the N_WEEKLY_AFTER_EARNINGS-th weekly expiry on or after earnings.
+
+        Tries all strikes from ATM downward (highest <= stock_price first).
         Returns ((long_put, short_put), "") or (None, reason_string).
         """
         puts = [c for c in chain if c.Right == OptionRight.Put]
         if not puts:
             return (None, "no puts in chain")
 
-        # All candidate strikes, highest (closest to ATM) first
         valid_strikes = sorted(set(p.Strike for p in puts if p.Strike <= stock_price),
                                reverse=True)
         if not valid_strikes:
             return (None, f"no strikes <= ${stock_price:.2f}")
 
-        # Track the best failure reason (from the ATM strike — most informative)
         first_reason = ""
 
         for strike in valid_strikes:
@@ -387,7 +393,6 @@ class EarningsCalendarPutMultiTicker(QCAlgorithm):
                     first_reason = f"K={strike} only {len(strike_puts)} expiry"
                 continue
 
-            # Split into before / after earnings
             before = [p for p in strike_puts if p.Expiry.date() < earnings_date]
             after  = [p for p in strike_puts if p.Expiry.date() >= earnings_date]
 
@@ -398,21 +403,26 @@ class EarningsCalendarPutMultiTicker(QCAlgorithm):
                                     f"expiries={expiries} earn={earnings_date}")
                 continue
 
-            # Closest expiry to earnings in each group
-            short_put = max(before, key=lambda p: p.Expiry)   # closest before
-            long_put  = min(after,  key=lambda p: p.Expiry)   # closest after
+            short_put = max(before, key=lambda p: p.Expiry)
 
-            spread_days = (long_put.Expiry.date() - short_put.Expiry.date()).days
-            if spread_days > MAX_SPREAD_DAYS:
+            gap_days = (earnings_date - short_put.Expiry.date()).days
+            if gap_days > MAX_SHORT_EARN_DAYS:
                 if not first_reason:
-                    first_reason = (f"K={strike} spread={spread_days}d > {MAX_SPREAD_DAYS}d "
-                                    f"(short_exp={short_put.Expiry.date()}, "
-                                    f"long_exp={long_put.Expiry.date()})")
+                    first_reason = (f"K={strike} short_exp={short_put.Expiry.date()} "
+                                    f"gap={gap_days}d > {MAX_SHORT_EARN_DAYS}d to earn={earnings_date}")
                 continue
+
+            after_sorted = sorted(after, key=lambda p: p.Expiry)
+            n_idx = N_WEEKLY_AFTER_EARNINGS - 1
+            if n_idx >= len(after_sorted):
+                if not first_reason:
+                    first_reason = (f"K={strike} only {len(after_sorted)} expiry(s) after earnings, "
+                                    f"need {N_WEEKLY_AFTER_EARNINGS}")
+                continue
+            long_put = after_sorted[n_idx]
 
             return ((long_put, short_put), "")
 
-        # None of the strikes had a valid pair
         return (None, f"{len(valid_strikes)} strikes tried, first fail: {first_reason}")
 
     # ── Entry ──────────────────────────────────────────────────────────────────
@@ -539,6 +549,21 @@ class EarningsCalendarPutMultiTicker(QCAlgorithm):
         long_sec.SetOptionAssignmentModel(NullAssignmentModel())
         short_sec.SetOptionAssignmentModel(NullAssignmentModel())
 
+        # Subscribe to calls at both strikes/expiries (for sim PnL at exit via put-call parity)
+        call_long = Symbol.CreateOption(
+            ts["stock_symbol"], long_put.Symbol.ID.Market,
+            OptionStyle.American, OptionRight.Call,
+            long_put.Strike, long_put.Expiry)
+        self.AddOptionContract(call_long, _res)
+        ts["call_symbol_long"] = call_long
+
+        call_short = Symbol.CreateOption(
+            ts["stock_symbol"], short_put.Symbol.ID.Market,
+            OptionStyle.American, OptionRight.Call,
+            short_put.Strike, short_put.Expiry)
+        self.AddOptionContract(call_short, _res)
+        ts["call_symbol_short"] = call_short
+
         # Defer short put + stock hedge until long put limit order fills
         ts["pending_short_put"]    = True
         ts["pending_hedge_shares"] = n_shares
@@ -564,6 +589,8 @@ class EarningsCalendarPutMultiTicker(QCAlgorithm):
         if active > self._max_concurrent:
             self._max_concurrent = active
 
+        ts["vix_entry"] = self._get_vix()
+
     # ── Exit ──────────────────────────────────────────────────────────────────
 
     def _exit_position(self, ticker):
@@ -572,6 +599,8 @@ class EarningsCalendarPutMultiTicker(QCAlgorithm):
             return
         if ts.get("force_exited"):
             return   # already emergency-closed (e.g. stock split)
+
+        ts["vix_exit"] = self._get_vix()
 
         # Read exit IV from chain (long put, for logging + min/max tracking)
         put_exit_iv = 0.0
@@ -620,6 +649,37 @@ class EarningsCalendarPutMultiTicker(QCAlgorithm):
         stk_pnl   = ts["stock_realized"]
         total_pnl = long_pnl + short_pnl + stk_pnl
 
+        # ── Sim PnL (fair-value exit using intrinsic + call time value) ──
+        s_price      = self.Securities[ts["stock_symbol"]].Price
+        long_strike  = self.Securities[ts["put_symbol"]].Symbol.ID.StrikePrice
+        short_strike = self.Securities[ts["short_put_symbol"]].Symbol.ID.StrikePrice
+
+        if s_price >= long_strike:
+            sim_long_exit = _mid(_long_sec.BidPrice, _long_sec.AskPrice)
+        else:
+            call_long_mid = 0.0
+            cl_sym = ts.get("call_symbol_long")
+            if cl_sym and self.Securities.ContainsKey(cl_sym):
+                _cl = self.Securities[cl_sym]
+                call_long_mid = _mid(_cl.BidPrice, _cl.AskPrice)
+            sim_long_exit = (long_strike - s_price) + call_long_mid
+
+        if s_price >= short_strike:
+            sim_short_exit = _mid(_short_sec.BidPrice, _short_sec.AskPrice)
+        else:
+            call_short_mid = 0.0
+            cs_sym = ts.get("call_symbol_short")
+            if cs_sym and self.Securities.ContainsKey(cs_sym):
+                _cs = self.Securities[cs_sym]
+                call_short_mid = _mid(_cs.BidPrice, _cs.AskPrice)
+            sim_short_exit = (short_strike - s_price) + call_short_mid
+
+        if sim_long_exit > 0 and ts["put_entry_fill"] > 0:
+            sim_pnl = ((sim_long_exit - ts["put_entry_fill"])
+                     - (sim_short_exit - ts["short_put_entry_fill"])) * n_contracts * 100 + stk_pnl
+        else:
+            sim_pnl = 0.0
+
         # Stock % change
         entry_px = ts["stock_entry_price"]
         exit_px  = self.Securities[ts["stock_symbol"]].Price
@@ -646,6 +706,9 @@ class EarningsCalendarPutMultiTicker(QCAlgorithm):
             "stk_pnl":            stk_pnl,
             "stk_chg_pct":        stk_chg_pct,
             "total":              total_pnl,
+            "sim_pnl":            sim_pnl,
+            "vix_entry":          ts["vix_entry"],
+            "vix_exit":           ts["vix_exit"],
             "iv_entry":           _long_iv,
             "iv_exit":            put_exit_iv,
             "rv":                 _rv,
@@ -657,6 +720,10 @@ class EarningsCalendarPutMultiTicker(QCAlgorithm):
             "long_spread_exit":   ts["long_spread_exit"],
             "short_spread_exit":  ts["short_spread_exit"],
             "hedge_count":        ts["hedge_count"],
+            "short_put_entry_px": ts["short_put_entry_fill"],
+            "short_put_exit_px":  ts["short_put_exit_fill"],
+            "long_put_entry_px":  ts["put_entry_fill"],
+            "long_put_exit_px":   ts["put_exit_fill"],
         })
 
         # ── Post-exit reconciliation: verify portfolio is actually flat ────
@@ -821,9 +888,9 @@ class EarningsCalendarPutMultiTicker(QCAlgorithm):
         if adj == 0:
             return
 
-        self._log(f"  [{ticker}] HEDGE: long_d={long_delta:.4f} short_d={short_delta:.4f} "
-                 f"opt_delta={option_delta:+.0f} stock_qty={ts['stock_qty']} "
-                 f"target={target} adj={adj:+.0f} price={s_price:.2f}")
+        # self._log(f"  [{ticker}] HEDGE: long_d={long_delta:.4f} short_d={short_delta:.4f} "
+        #          f"opt_delta={option_delta:+.0f} stock_qty={ts['stock_qty']} "
+        #          f"target={target} adj={adj:+.0f} price={s_price:.2f}")
 
         self._filling_ticker = ticker
         self.MarketOrder(ts["stock_symbol"], adj)
@@ -862,6 +929,16 @@ class EarningsCalendarPutMultiTicker(QCAlgorithm):
         except Exception:
             return 0.0
 
+    def _get_vix(self):
+        """Fetch most recent VIX close via History() with 5-day lookback."""
+        try:
+            h = self.History(self._vix_symbol, 5, Resolution.Daily)
+            if not h.empty:
+                return float(h["close"].iloc[-1])
+        except Exception:
+            pass
+        return None
+
     def _reset(self, ticker):
         ts = self._ts[ticker]
         ts["state"]               = "FLAT"
@@ -885,12 +962,16 @@ class EarningsCalendarPutMultiTicker(QCAlgorithm):
         ts["stock_entry_price"]   = 0.0
         ts["entry_earnings"]      = None
         ts["entry_rv"]            = 0.0
+        ts["vix_entry"]           = None
+        ts["vix_exit"]            = None
         ts["force_exited"]        = False
         ts["_closing_forced"]     = False
         ts["hedge_count"]         = 0
         # Note: orphan_cleaned is NOT reset here — it stays True until
         # _enter_position clears it, preventing repeated cleanup in FLAT state.
         ts["total_fees"]          = 0.0
+        ts["call_symbol_long"]    = None
+        ts["call_symbol_short"]   = None
         ts["long_spread_entry"]   = 0
         ts["short_spread_entry"]  = 0
         ts["long_spread_exit"]    = 0
@@ -944,7 +1025,7 @@ class EarningsCalendarPutMultiTicker(QCAlgorithm):
                 self._ol(lines, f"{'='*80}")
                 continue
 
-            totals = {"long": 0.0, "short": 0.0, "stk": 0.0, "total": 0.0}
+            totals = {"long": 0.0, "short": 0.0, "stk": 0.0, "total": 0.0, "sim": 0.0}
             valid  = [t for t in trade_log if t["iv_exit"] != 0.0]
             wins   = sum(1 for t in valid if t["total"] >= 0)
             nv     = len(valid)
@@ -962,6 +1043,8 @@ class EarningsCalendarPutMultiTicker(QCAlgorithm):
                 f" {'Stock PnL':>12}"
                 f" {'Stk Chg%':>9}"
                 f" {'Combined':>12}"
+                f" {'SimPnL':>12}"
+                f" {'VIXen':>6} {'VIXex':>6}"
                 f" {'IV entry':>9}"
                 f" {'IV exit':>8}"
                 f" {'IVspread':>9}"
@@ -972,6 +1055,11 @@ class EarningsCalendarPutMultiTicker(QCAlgorithm):
                 f" {'SSpEn':>7}"
                 f" {'LSpEx':>7}"
                 f" {'SSpEx':>7}"
+                f" {'SPen':>8}"
+                f" {'SPex':>8}"
+                f" {'LPen':>8}"
+                f" {'LPex':>8}"
+                f" {'nCal':>5}"
             )
             self._ol(lines, f"  {'-'*160}")
 
@@ -988,11 +1076,20 @@ class EarningsCalendarPutMultiTicker(QCAlgorithm):
                 iv_spr  = t.get("iv_spread_entry", 0.0)
                 sh_rv   = t.get("short_iv_rv", 0.0)
                 nc = t.get("n_contracts", 0)
+                _sim  = t.get("sim_pnl", 0.0)
+                _vixen = t.get("vix_entry")
+                _vixxs = t.get("vix_exit")
+                _vixen_s = f"{_vixen:.1f}" if _vixen else "n/a"
+                _vixxs_s = f"{_vixxs:.1f}" if _vixxs else "n/a"
                 _lse = t.get("long_spread_entry", 0)
                 _sse = t.get("short_spread_entry", 0)
                 _lsx = t.get("long_spread_exit", 0)
                 _ssx = t.get("short_spread_exit", 0)
                 _hcnt = t.get("hedge_count", 0)
+                _spen = t.get("short_put_entry_px", 0.0)
+                _spex = t.get("short_put_exit_px", 0.0)
+                _lpen = t.get("long_put_entry_px", 0.0)
+                _lpex = t.get("long_put_exit_px", 0.0)
                 self._ol(lines,
                     f"  {tag} {t['earnings']!s:<11}"
                     f"  {nc:>5}"
@@ -1001,6 +1098,8 @@ class EarningsCalendarPutMultiTicker(QCAlgorithm):
                     f"  ${t['stk_pnl']:>+10,.2f}"
                     f"  {chg:>+7.1f}%"
                     f"  ${t['total']:>+10,.2f}"
+                    f"  ${_sim:>+10,.2f}"
+                    f"  {_vixen_s:>6} {_vixxs_s:>6}"
                     f"  {t['iv_entry']:>8.1%}"
                     f"  {t['iv_exit']:>7.1%}"
                     f"  {iv_spr:>8.1%}"
@@ -1011,12 +1110,18 @@ class EarningsCalendarPutMultiTicker(QCAlgorithm):
                     f"  {_sse:>7}"
                     f"  {_lsx:>7}"
                     f"  {_ssx:>7}"
+                    f"  {_spen:>8.2f}"
+                    f"  {_spex:>8.2f}"
+                    f"  {_lpen:>8.2f}"
+                    f"  {_lpex:>8.2f}"
+                    f"  {nc:>5}"
                     f"  Hdg={_hcnt}"
                 )
                 totals["long"]  += t["long_pnl"]
                 totals["short"] += t["short_pnl"]
                 totals["stk"]   += t["stk_pnl"]
                 totals["total"] += t["total"]
+                totals["sim"]   += _sim
 
             printed = n - skipped
             avg = totals["total"] / printed if printed > 0 else 0.0
@@ -1028,6 +1133,7 @@ class EarningsCalendarPutMultiTicker(QCAlgorithm):
                 f"  ${totals['stk']:>+10,.2f}"
                 f"  {'':>9}"
                 f"  ${totals['total']:>+10,.2f}"
+                f"  ${totals['sim']:>+10,.2f}"
             )
             ticker_hedges = sum(t.get("hedge_count", 0) for t in valid)
             avg_hedges = ticker_hedges / printed if printed > 0 else 0.0

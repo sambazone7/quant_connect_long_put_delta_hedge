@@ -92,6 +92,9 @@ def _immediate_close_all(self, ticker, reason):
         "stk_pnl":            stk_pnl,
         "stk_chg_pct":        stk_chg_pct,
         "total":              total,
+        "sim_pnl":            0.0,
+        "vix_entry":          ts["vix_entry"],
+        "vix_exit":           ts["vix_exit"],
         "iv_entry":           _long_iv,
         "iv_exit":            0.0,
         "rv":                 _rv,
@@ -99,7 +102,15 @@ def _immediate_close_all(self, ticker, reason):
         "short_iv_entry":     _short_iv,
         "short_iv_rv":        _short_iv / _rv if _rv > 0 else 0.0,
         "_assign_strike":     short_strike,
+        "long_spread_entry":  ts.get("long_spread_entry", 0),
+        "short_spread_entry": ts.get("short_spread_entry", 0),
+        "long_spread_exit":   0,
+        "short_spread_exit":  0,
         "hedge_count":        ts["hedge_count"],
+        "short_put_entry_px": ts["short_put_entry_fill"],
+        "short_put_exit_px":  ts["short_put_exit_fill"],
+        "long_put_entry_px":  ts["put_entry_fill"],
+        "long_put_exit_px":   ts["put_exit_fill"],
     })
     ts["traded_earnings"].add(ed)
     self._reset(ticker)
@@ -137,6 +148,9 @@ def _finalize_forced_exit(self, ticker):
         "stk_pnl":            stk_pnl,
         "stk_chg_pct":        stk_chg_pct,
         "total":              total,
+        "sim_pnl":            0.0,
+        "vix_entry":          ts["vix_entry"],
+        "vix_exit":           ts["vix_exit"],
         "iv_entry":           _long_iv,
         "iv_exit":            0.0,
         "rv":                 _rv,
@@ -148,6 +162,10 @@ def _finalize_forced_exit(self, ticker):
         "long_spread_exit":   0,
         "short_spread_exit":  0,
         "hedge_count":        ts["hedge_count"],
+        "short_put_entry_px": ts["short_put_entry_fill"],
+        "short_put_exit_px":  ts["short_put_exit_fill"],
+        "long_put_entry_px":  ts["put_entry_fill"],
+        "long_put_exit_px":   ts["put_exit_fill"],
     })
     self._log(f"  [{self.Time.date()}] FORCED EXIT FINALIZED: "
               f"{ticker} longPnL=${long_pnl:+,.0f} shortPnL=${short_pnl:+,.0f} "
@@ -245,6 +263,9 @@ def _finalize_emergency_exit(self, ticker):
         "stk_pnl":            stk_pnl,
         "stk_chg_pct":        stk_chg_pct,
         "total":              total,
+        "sim_pnl":            0.0,
+        "vix_entry":          ts["vix_entry"],
+        "vix_exit":           ts["vix_exit"],
         "iv_entry":           _long_iv,
         "iv_exit":            0.0,
         "rv":                 _rv,
@@ -256,6 +277,10 @@ def _finalize_emergency_exit(self, ticker):
         "long_spread_exit":   0,
         "short_spread_exit":  0,
         "hedge_count":        ts["hedge_count"],
+        "short_put_entry_px": ts["short_put_entry_fill"],
+        "short_put_exit_px":  ts["short_put_exit_fill"],
+        "long_put_entry_px":  ts["put_entry_fill"],
+        "long_put_exit_px":   ts["put_exit_fill"],
     })
     ts["traded_earnings"].add(ed)
     self._reset(ticker)
@@ -401,6 +426,9 @@ def _check_orphaned_positions(self, ticker):
             "stk_pnl":            stk_pnl,
             "stk_chg_pct":        stk_chg_pct,
             "total":              total,
+            "sim_pnl":            0.0,
+            "vix_entry":          ts["vix_entry"],
+            "vix_exit":           ts["vix_exit"],
             "iv_entry":           _long_iv,
             "iv_exit":            0.0,
             "rv":                 _rv,
@@ -412,6 +440,10 @@ def _check_orphaned_positions(self, ticker):
             "long_spread_exit":   0,
             "short_spread_exit":  0,
             "hedge_count":        ts["hedge_count"],
+            "short_put_entry_px": ts["short_put_entry_fill"],
+            "short_put_exit_px":  ts["short_put_exit_fill"],
+            "long_put_entry_px":  ts["put_entry_fill"],
+            "long_put_exit_px":   ts["put_exit_fill"],
         })
         ts["traded_earnings"].add(ed)
         self._reset(ticker)
