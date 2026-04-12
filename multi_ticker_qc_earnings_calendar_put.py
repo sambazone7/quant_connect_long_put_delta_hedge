@@ -32,6 +32,7 @@ class EarningsCalendarPutMultiTicker(QCAlgorithm):
         self._all_lines = []       # collect ALL log lines for ObjectStore
         self._filling_ticker = None  # set around our own orders to distinguish from auto-liquidation
         self._total_fees = 0.0     # accumulated fees across all tickers and orders
+        self._theta_exits = 0      # count of trades closed by THETA_WATCHER
         self._vix_symbol = self.AddData(CBOE, "VIX", Resolution.Daily).Symbol
 
         _exp_max = K * 2 + 20   # broad enough to capture weeklies around earnings
@@ -792,9 +793,6 @@ class EarningsCalendarPutMultiTicker(QCAlgorithm):
         if ts["state"] != "ACTIVE" or ts["chain"] is None:
             return
 
-        if not DELTA_HEDGE:
-            return
-
         stock   = self.Securities[ts["stock_symbol"]]
         s_price = stock.Price
         if s_price <= 0:
@@ -829,6 +827,21 @@ class EarningsCalendarPutMultiTicker(QCAlgorithm):
 
         # Combined option Greeks (long n puts, short n puts):
         n = ts["put_contracts"]
+
+        # ── Theta watcher: exit if combined theta turns negative ──────────
+        if THETA_WATCHER:
+            _lt = long_theta if long_theta else 0.0
+            _st = short_theta if short_theta else 0.0
+            net_theta = (_lt - _st) * n * 100
+            if net_theta < 0:
+                self._log(f"  [{ticker}] THETA EXIT: net_theta={net_theta:.2f} < 0 — closing position")
+                self._theta_exits += 1
+                self._exit_position(ticker)
+                return
+
+        if not DELTA_HEDGE:
+            return
+
         option_delta = (long_delta - short_delta) * n * 100
 
         stock_delta    = ts["stock_qty"]
@@ -1140,6 +1153,8 @@ class EarningsCalendarPutMultiTicker(QCAlgorithm):
             ticker_hedges = sum(t.get("hedge_count", 0) for t in valid)
             avg_hedges = ticker_hedges / printed if printed > 0 else 0.0
             self._ol(lines, f"  Avg PnL/trade: ${avg:+,.2f}  |  Hedges: {ticker_hedges} total, {avg_hedges:.1f} avg/trade")
+            if self._theta_exits > 0 and len(self._ts) == 1:
+                self._ol(lines, f"  Theta exits: {self._theta_exits}")
             self._ol(lines, f"{'='*80}")
             grand_total  += totals["total"]
             grand_hedges += ticker_hedges
@@ -1152,6 +1167,8 @@ class EarningsCalendarPutMultiTicker(QCAlgorithm):
             self._ol(lines, f"  Combined PnL: ${grand_total:+,.2f}  |  Avg PnL/trade: ${grand_total / grand_trades:+,.2f}  |  Hedges: {grand_hedges} total, {avg_h:.1f} avg/trade" if grand_trades else f"  Combined PnL: ${grand_total:+,.2f}")
             self._ol(lines, f"  Total Fees:   ${self._total_fees:,.2f}  |  PnL net of fees: ${grand_total - self._total_fees:+,.2f}")
             self._ol(lines, f"  SKIP TOTALS: {grand_attempts} attempted | {grand_trades} traded | {grand_skipped} skipped (no_pair={grand_no_pair}, low_debit={grand_low_debit}, other={grand_other_skip})")
+            if self._theta_exits > 0:
+                self._ol(lines, f"  Theta exits: {self._theta_exits}")
             self._ol(lines, f"{'='*80}")
 
         # ── Persist full log to ObjectStore (no 100 KB cap) ──────────────

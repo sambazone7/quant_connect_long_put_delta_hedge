@@ -7,7 +7,7 @@ import requests
 # Ensure import * exports underscore-prefixed names too
 __all__ = [
     "N", "K", "S", "MIN_NET_DEBIT", "SPREAD_CUTOFF_PCT", "DELTA_HEDGE",
-    "HEDGE_MODE", "PNL_TOLERANCE", "THETA_K", "MIN_TOLERANCE", "DRIFT_FLOOR",
+    "HEDGE_MODE", "PNL_TOLERANCE", "THETA_K", "MIN_TOLERANCE", "DRIFT_FLOOR", "THETA_WATCHER",
     "D_mult", "RV_SIGMA", "Z",
     "MAX_PUT_PCT", "PUT_LIMIT_MULT", "N_WEEKLY_AFTER_EARNINGS", "MAX_SHORT_EARN_DAYS", "PRICE_MODEL",
     "HOURLY_BARS", "TRADE_TIME_MIN", "HEDGE_TIME_MIN", "EXIT_DAYS_BEFORE",
@@ -33,6 +33,7 @@ PNL_TOLERANCE = 100      # (gamma mode) Dollar P&L threshold per position before
 THETA_K       = 1.0      # (theta mode) Scalar on daily theta: tol = THETA_K × |θ_daily_position|
 MIN_TOLERANCE = 50       # (theta mode) Floor on dynamic tolerance to guard against near-zero theta
 DRIFT_FLOOR   = 0.10     # (gamma/theta) Max |position_delta| as fraction of option exposure (0.10 = 10%)
+THETA_WATCHER = False    # True → exit position immediately when combined daily theta turns negative
 D_mult  = 1.0    # (sigma mode) tolerance = D_mult × daily_sigma_frac × |option_exposure|
 RV_SIGMA = True   # (sigma mode) True → 30d realized vol; False → long put's live IV
 Z      = 0.0      # IV/RV filter: skip entry if IV/RV >= Z  (0.0 = disabled)
