@@ -666,14 +666,9 @@ class EarningsCalendarPutMultiTicker(QCAlgorithm):
             sim_long_exit = (long_strike - s_price) + call_long_mid
 
         if s_price >= short_strike:
-            sim_short_exit = _mid(_short_sec.BidPrice, _short_sec.AskPrice)
+            sim_short_exit = 0.0
         else:
-            call_short_mid = 0.0
-            cs_sym = ts.get("call_symbol_short")
-            if cs_sym and self.Securities.ContainsKey(cs_sym):
-                _cs = self.Securities[cs_sym]
-                call_short_mid = _mid(_cs.BidPrice, _cs.AskPrice)
-            sim_short_exit = (short_strike - s_price) + call_short_mid
+            sim_short_exit = short_strike - s_price
 
         if sim_long_exit > 0 and ts["put_entry_fill"] > 0:
             sim_pnl = ((sim_long_exit - ts["put_entry_fill"])
