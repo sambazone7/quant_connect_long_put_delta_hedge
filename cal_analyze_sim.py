@@ -2,10 +2,10 @@
 """
 Analyse calendar-spread trades CSV for sim_pnl relationships.
 
-Focuses on: VIX entry, IV long/short ratio, and |stock change %| vs sim_pnl.
+Focuses on: VIX entry, IV long/short ratio, |stock change %|, and short-leg IV vs sim_pnl.
 
 Usage:
-    python analyze_cal_sim.py <input.csv> <output.out>
+    python cal_analyze_sim.py <input.csv> <output.out>
 """
 import csv, sys, statistics, argparse
 
@@ -58,6 +58,8 @@ with open(args.csvfile, "r", encoding="utf-8", errors="replace") as f:
         iv_long = pct(row.get("iv_long_entry", ""))
         iv_short = pct(row.get("iv_short_entry", ""))
         stk_chg = parse_signed(row.get("stk_chg_pct", ""))
+        stk_max_up = parse_signed(row.get("stk_max_up_pct", ""))
+        stk_max_dn = parse_signed(row.get("stk_max_dn_pct", ""))
         stk_pnl   = money(row.get("stock_pnl", ""))
         long_pnl  = money(row.get("long_pnl", ""))
         short_pnl = money(row.get("short_pnl", ""))
@@ -76,8 +78,10 @@ with open(args.csvfile, "r", encoding="utf-8", errors="replace") as f:
             "iv_long":     iv_long,
             "iv_short":    iv_short,
             "iv_ratio":    iv_ratio,
-            "stk_chg_pct": stk_chg,
-            "stk_pnl":     stk_pnl,
+            "stk_chg_pct":    stk_chg,
+            "stk_max_up_pct": stk_max_up,
+            "stk_max_dn_pct": stk_max_dn,
+            "stk_pnl":        stk_pnl,
             "long_pnl":    long_pnl,
             "short_pnl":   short_pnl,
             "abs_stk_chg": abs(stk_chg) if stk_chg is not None else None,
@@ -259,11 +263,48 @@ write_band_row("ALL (with Stk Chg%)", stk_rows)
 out.write("\n")
 
 # ════════════════════════════════════════════════════════════════════════════
-# 5. TOP 100 LOSING & WINNING TRADES
+# 5. SHORT LEG IV ENTRY vs SIM PNL
 # ════════════════════════════════════════════════════════════════════════════
 
 out.write("=" * 80 + "\n")
-out.write("5. TOP 100 LOSING & WINNING TRADES (by sim_pnl)\n")
+out.write("5. SHORT LEG IV ENTRY vs SIM PNL\n")
+out.write("   Question: Does lower short-leg IV at entry lead to higher sim_pnl?\n")
+out.write("=" * 80 + "\n\n")
+
+iv_short_rows = [r for r in rows if r["iv_short"] is not None]
+
+if len(iv_short_rows) >= 5:
+    out.write("Short IV entry quintile analysis:\n")
+    out.write(f"{'Quintile':<12} {'ShortIV Range':<22}     {'N':>5} {'Total SimPnL':>16} {'Avg SimPnL':>12} {'Median':>14}    {'Win%'}\n")
+    out.write("-" * 100 + "\n")
+    sorted_iv_short = sorted(iv_short_rows, key=lambda r: r["iv_short"])
+    write_quintile("iv_short", sorted_iv_short, fmt_pct=True)
+
+out.write("Short IV entry fixed-band analysis:\n")
+out.write(f"{'Band':<25}   {'N':>5} {'Total SimPnL':>16} {'Avg SimPnL':>12} {'Median':>12}    {'Win%'}\n")
+out.write("-" * 85 + "\n")
+
+iv_short_bands = [
+    ("ShIV < 20%",             lambda r: r["iv_short"] is not None and r["iv_short"] < 0.20),
+    ("20% <= ShIV < 30%",      lambda r: r["iv_short"] is not None and 0.20 <= r["iv_short"] < 0.30),
+    ("30% <= ShIV < 40%",      lambda r: r["iv_short"] is not None and 0.30 <= r["iv_short"] < 0.40),
+    ("40% <= ShIV < 50%",      lambda r: r["iv_short"] is not None and 0.40 <= r["iv_short"] < 0.50),
+    ("50% <= ShIV < 60%",      lambda r: r["iv_short"] is not None and 0.50 <= r["iv_short"] < 0.60),
+    ("ShIV >= 60%",            lambda r: r["iv_short"] is not None and r["iv_short"] >= 0.60),
+]
+for label, filt in iv_short_bands:
+    b = [r for r in iv_short_rows if filt(r)]
+    write_band_row(label, b)
+out.write("-" * 85 + "\n")
+write_band_row("ALL (with ShortIV)", iv_short_rows)
+out.write("\n")
+
+# ════════════════════════════════════════════════════════════════════════════
+# 6. TOP 100 LOSING & WINNING TRADES
+# ════════════════════════════════════════════════════════════════════════════
+
+out.write("=" * 80 + "\n")
+out.write("6. TOP 100 LOSING & WINNING TRADES (by sim_pnl)\n")
 out.write("=" * 80 + "\n")
 
 sorted_by_sim = sorted(rows, key=lambda r: r["sim_pnl"])
@@ -273,7 +314,7 @@ def write_trade_table(label, trade_list):
     hdr = (f"  {'Ticker':<7} {'Earnings':>10}"
            f" {'VIXen':>7} {'VIXex':>7}"
            f" {'IVratio':>8}"
-           f" {'StkChg%':>8}"
+           f" {'MaxUp%':>8} {'MaxDn%':>8} {'StkChg%':>8}"
            f" {'LongPnL':>14} {'ShortPnL':>14} {'StkPnL':>14}"
            f" {'SimPnL':>14}\n")
     out.write(hdr)
@@ -284,6 +325,8 @@ def write_trade_table(label, trade_list):
             f" {_fmt(r['vix_entry'], '.1f'):>7}"
             f" {_fmt(r['vix_exit'], '.1f'):>7}"
             f" {_fmt(r['iv_ratio'], '.3f'):>8}"
+            f" {_fmt(r['stk_max_up_pct'], '+.1f', '%'):>8}"
+            f" {_fmt(r['stk_max_dn_pct'], '+.1f', '%'):>8}"
             f" {_fmt(r['stk_chg_pct'], '+.1f', '%'):>8}"
             f" ${r['long_pnl']:>+12,.2f}"
             f" ${r['short_pnl']:>+12,.2f}"

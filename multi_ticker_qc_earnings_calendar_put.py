@@ -76,6 +76,8 @@ class EarningsCalendarPutMultiTicker(QCAlgorithm):
                 "stock_cost_basis":     0.0,
                 "stock_realized":       0.0,
                 "last_hedge_price":     0.0,
+                "stock_max_up_pct":    0.0,
+                "stock_max_dn_pct":    0.0,
                 "entry_earnings":       None,
                 "entry_rv":             0.0,
                 "vix_entry":           None,
@@ -536,6 +538,8 @@ class EarningsCalendarPutMultiTicker(QCAlgorithm):
         ts["stock_realized"]      = 0.0
         ts["last_hedge_price"]    = s_price
         ts["stock_entry_price"]   = s_price
+        ts["stock_max_up_pct"]    = 0.0
+        ts["stock_max_dn_pct"]    = 0.0
         ts["entry_earnings"]      = earnings_dt
         ts["entry_rv"]            = rv
         ts["long_spread_entry"]   = round(abs(long_put.BidPrice - long_put.AskPrice) * 100 * n_contracts)
@@ -676,10 +680,14 @@ class EarningsCalendarPutMultiTicker(QCAlgorithm):
         else:
             sim_pnl = 0.0
 
-        # Stock % change
+        # Stock % change + final max-deviation update
         entry_px = ts["stock_entry_price"]
         exit_px  = self.Securities[ts["stock_symbol"]].Price
         stk_chg_pct = ((exit_px - entry_px) / entry_px * 100) if entry_px > 0 else 0.0
+        if entry_px > 0:
+            _dev = (exit_px - entry_px) / entry_px * 100
+            ts["stock_max_up_pct"] = max(ts["stock_max_up_pct"], _dev)
+            ts["stock_max_dn_pct"] = min(ts["stock_max_dn_pct"], _dev)
 
         ed = ts["entry_earnings"].date()
 
@@ -700,6 +708,8 @@ class EarningsCalendarPutMultiTicker(QCAlgorithm):
             "long_pnl":           long_pnl,
             "short_pnl":          short_pnl,
             "stk_pnl":            stk_pnl,
+            "stk_max_up_pct":     ts["stock_max_up_pct"],
+            "stk_max_dn_pct":     ts["stock_max_dn_pct"],
             "stk_chg_pct":        stk_chg_pct,
             "total":              total_pnl,
             "sim_pnl":            sim_pnl,
@@ -792,6 +802,12 @@ class EarningsCalendarPutMultiTicker(QCAlgorithm):
         s_price = stock.Price
         if s_price <= 0:
             return
+
+        entry_px = ts["stock_entry_price"]
+        if entry_px > 0:
+            _dev = (s_price - entry_px) / entry_px * 100
+            ts["stock_max_up_pct"] = max(ts["stock_max_up_pct"], _dev)
+            ts["stock_max_dn_pct"] = min(ts["stock_max_dn_pct"], _dev)
 
         # ── Step 1: Compute live Greeks for both legs ────────────────────────
         long_delta = long_gamma = long_theta = None
@@ -968,6 +984,8 @@ class EarningsCalendarPutMultiTicker(QCAlgorithm):
         ts["stock_realized"]      = 0.0
         ts["last_hedge_price"]    = 0.0
         ts["stock_entry_price"]   = 0.0
+        ts["stock_max_up_pct"]    = 0.0
+        ts["stock_max_dn_pct"]    = 0.0
         ts["entry_earnings"]      = None
         ts["entry_rv"]            = 0.0
         ts["vix_entry"]           = None
@@ -1049,6 +1067,8 @@ class EarningsCalendarPutMultiTicker(QCAlgorithm):
                 f" {'Long PnL':>12}"
                 f" {'Short PnL':>12}"
                 f" {'Stock PnL':>12}"
+                f" {'MaxUp%':>8}"
+                f" {'MaxDn%':>8}"
                 f" {'Stk Chg%':>9}"
                 f" {'Combined':>12}"
                 f" {'SimPnL':>12}"
@@ -1105,6 +1125,8 @@ class EarningsCalendarPutMultiTicker(QCAlgorithm):
                     f"  ${t['long_pnl']:>+10,.2f}"
                     f"  ${t['short_pnl']:>+10,.2f}"
                     f"  ${t['stk_pnl']:>+10,.2f}"
+                    f"  {t.get('stk_max_up_pct', 0.0):>+7.1f}%"
+                    f"  {t.get('stk_max_dn_pct', 0.0):>+7.1f}%"
                     f"  {chg:>+7.1f}%"
                     f"  ${t['total']:>+10,.2f}"
                     f"  ${_sim:>+10,.2f}"
@@ -1141,6 +1163,8 @@ class EarningsCalendarPutMultiTicker(QCAlgorithm):
                 f"  ${totals['long']:>+10,.2f}"
                 f"  ${totals['short']:>+10,.2f}"
                 f"  ${totals['stk']:>+10,.2f}"
+                f"  {'':>8}"
+                f"  {'':>8}"
                 f"  {'':>9}"
                 f"  ${totals['total']:>+10,.2f}"
                 f"  ${totals['sim']:>+10,.2f}"

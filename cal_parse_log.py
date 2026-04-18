@@ -31,7 +31,7 @@ skip_totals_re = re.compile(
 )
 
 # Trade row:
-# [-] 2025-07-23      19  $ +3,154.00  $ -3,325.00  $ -1,566.48     -6.5%  $ -1,737.48  $ -1,290.98    19.8   17.2     62.8%    55.0%    67.5%      6.1%      0.72      +7%    0.80      285      285      285      475     12.50     8.30    15.20    10.40     19  Hdg=6
+# [-] 2025-07-23      19  $ +3,154.00  $ -3,325.00  $ -1,566.48   +2.3%   -8.1%     -6.5%  $ -1,737.48  $ -1,290.98    19.8   17.2     62.8%    55.0%    67.5%      6.1%      0.72      +7%    0.80      285      285      285      475     12.50     8.30    15.20    10.40     19  Hdg=6
 trade_re = re.compile(
     r'\[([+-])\]\s+'                          #  1  win/loss
     r'(\d{4}-\d{2}-\d{2})\s+'                #  2  earnings date
@@ -39,28 +39,30 @@ trade_re = re.compile(
     r'\$\s*([+-]?[\d,]+\.\d+)\s+'            #  4  long_pnl
     r'\$\s*([+-]?[\d,]+\.\d+)\s+'            #  5  short_pnl
     r'\$\s*([+-]?[\d,]+\.\d+)\s+'            #  6  stock_pnl
-    r'([+-]?\d+\.?\d*)%\s+'                  #  7  stk_chg_pct
-    r'\$\s*([+-]?[\d,]+\.\d+)\s+'            #  8  combined
-    r'\$\s*([+-]?[\d,]+\.\d+)\s+'            #  9  sim_pnl
-    r'(?:(\d+\.?\d*)|n/a)\s+'                # 10  vix_entry (float or n/a)
-    r'(?:(\d+\.?\d*)|n/a)\s+'                # 11  vix_exit  (float or n/a)
-    r'(\d+\.?\d*)%\s+'                       # 12  iv_long_entry
-    r'(\d+\.?\d*)%\s+'                       # 13  iv_short_entry
-    r'(\d+\.?\d*)%\s+'                       # 14  iv_long_exit
-    r'([+-]?\d+\.?\d*)%\s+'                  # 15  ivspread
-    r'(\d+\.?\d+)\s+'                        # 16  shiv_rv
-    r'([+-]\d+)%\s+'                         # 17  iv_change
-    r'(\d+\.?\d+)\s+'                        # 18  iv_rv
-    r'(\d+)\s+'                              # 19  long_spread_entry
-    r'(\d+)\s+'                              # 20  short_spread_entry
-    r'(\d+)\s+'                              # 21  long_spread_exit
-    r'(\d+)\s+'                              # 22  short_spread_exit
-    r'(\d+\.?\d*)\s+'                        # 23  short_put_entry_px
-    r'(\d+\.?\d*)\s+'                        # 24  short_put_exit_px
-    r'(\d+\.?\d*)\s+'                        # 25  long_put_entry_px
-    r'(\d+\.?\d*)\s+'                        # 26  long_put_exit_px
-    r'(\d+)\s+'                              # 27  n_calendars
-    r'Hdg=(\d+)'                             # 28  hedge_count
+    r'([+-]?\d+\.?\d*)%\s+'                  #  7  stk_max_up_pct
+    r'([+-]?\d+\.?\d*)%\s+'                  #  8  stk_max_dn_pct
+    r'([+-]?\d+\.?\d*)%\s+'                  #  9  stk_chg_pct
+    r'\$\s*([+-]?[\d,]+\.\d+)\s+'            # 10  combined
+    r'\$\s*([+-]?[\d,]+\.\d+)\s+'            # 11  sim_pnl
+    r'(?:(\d+\.?\d*)|n/a)\s+'                # 12  vix_entry (float or n/a)
+    r'(?:(\d+\.?\d*)|n/a)\s+'                # 13  vix_exit  (float or n/a)
+    r'(\d+\.?\d*)%\s+'                       # 14  iv_long_entry
+    r'(\d+\.?\d*)%\s+'                       # 15  iv_short_entry
+    r'(\d+\.?\d*)%\s+'                       # 16  iv_long_exit
+    r'([+-]?\d+\.?\d*)%\s+'                  # 17  ivspread
+    r'(\d+\.?\d+)\s+'                        # 18  shiv_rv
+    r'([+-]\d+)%\s+'                         # 19  iv_change
+    r'(\d+\.?\d+)\s+'                        # 20  iv_rv
+    r'(\d+)\s+'                              # 21  long_spread_entry
+    r'(\d+)\s+'                              # 22  short_spread_entry
+    r'(\d+)\s+'                              # 23  long_spread_exit
+    r'(\d+)\s+'                              # 24  short_spread_exit
+    r'(\d+\.?\d*)\s+'                        # 25  short_put_entry_px
+    r'(\d+\.?\d*)\s+'                        # 26  short_put_exit_px
+    r'(\d+\.?\d*)\s+'                        # 27  long_put_entry_px
+    r'(\d+\.?\d*)\s+'                        # 28  long_put_exit_px
+    r'(\d+)\s+'                              # 29  n_calendars
+    r'Hdg=(\d+)'                             # 30  hedge_count
 )
 
 # ── Parse ───────────────────────────────────────────────────────────────────
@@ -119,28 +121,30 @@ for line in lines:
             "long_pnl":           clean(m.group(4)),
             "short_pnl":          clean(m.group(5)),
             "stock_pnl":          clean(m.group(6)),
-            "stk_chg_pct":        m.group(7),
-            "combined":           clean(m.group(8)),
-            "sim_pnl":            clean(m.group(9)),
-            "vix_entry":          m.group(10) or "",
-            "vix_exit":           m.group(11) or "",
-            "iv_long_entry":      m.group(12) + "%",
-            "iv_short_entry":     m.group(13) + "%",
-            "iv_long_exit":       m.group(14) + "%",
-            "ivspread":           m.group(15) + "%",
-            "shiv_rv":            m.group(16),
-            "iv_change":          m.group(17) + "%",
-            "iv_rv":              m.group(18),
-            "long_spread_entry":  m.group(19),
-            "short_spread_entry": m.group(20),
-            "long_spread_exit":   m.group(21),
-            "short_spread_exit":  m.group(22),
-            "short_put_entry_px": m.group(23),
-            "short_put_exit_px":  m.group(24),
-            "long_put_entry_px":  m.group(25),
-            "long_put_exit_px":   m.group(26),
-            "n_calendars":        m.group(27),
-            "hedge_count":        m.group(28),
+            "stk_max_up_pct":     m.group(7),
+            "stk_max_dn_pct":     m.group(8),
+            "stk_chg_pct":        m.group(9),
+            "combined":           clean(m.group(10)),
+            "sim_pnl":            clean(m.group(11)),
+            "vix_entry":          m.group(12) or "",
+            "vix_exit":           m.group(13) or "",
+            "iv_long_entry":      m.group(14) + "%",
+            "iv_short_entry":     m.group(15) + "%",
+            "iv_long_exit":       m.group(16) + "%",
+            "ivspread":           m.group(17) + "%",
+            "shiv_rv":            m.group(18),
+            "iv_change":          m.group(19) + "%",
+            "iv_rv":              m.group(20),
+            "long_spread_entry":  m.group(21),
+            "short_spread_entry": m.group(22),
+            "long_spread_exit":   m.group(23),
+            "short_spread_exit":  m.group(24),
+            "short_put_entry_px": m.group(25),
+            "short_put_exit_px":  m.group(26),
+            "long_put_entry_px":  m.group(27),
+            "long_put_exit_px":   m.group(28),
+            "n_calendars":        m.group(29),
+            "hedge_count":        m.group(30),
         })
         continue
 
@@ -148,7 +152,7 @@ for line in lines:
 
 fields = [
     "ticker", "win", "earnings", "n_contracts",
-    "long_pnl", "short_pnl", "stock_pnl", "stk_chg_pct",
+    "long_pnl", "short_pnl", "stock_pnl", "stk_max_up_pct", "stk_max_dn_pct", "stk_chg_pct",
     "combined", "sim_pnl",
     "vix_entry", "vix_exit",
     "iv_short_entry",

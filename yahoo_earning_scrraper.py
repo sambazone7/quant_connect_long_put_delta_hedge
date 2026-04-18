@@ -45,6 +45,10 @@ EARNINGS_CSV_FIELDNAMES = [
     "exchange",
     "consistency_score_exact",
     "consistency_score_within1",
+    "iv_pre_earnings",
+    "iv_post_earnings",
+    "iv_ratio_post_pre",
+    "oi_post_earnings",
 ]
 
 _ENRICHMENT_COLUMN_KEYS = (
@@ -53,6 +57,10 @@ _ENRICHMENT_COLUMN_KEYS = (
     "exchange",
     "consistency_score_exact",
     "consistency_score_within1",
+    "iv_pre_earnings",
+    "iv_post_earnings",
+    "iv_ratio_post_pre",
+    "oi_post_earnings",
 )
 
 
@@ -395,6 +403,194 @@ def resolve_sector_industry(
     return (sector, industry)
 
 
+def _find_prev_friday(expected_dt: datetime, days_back: int) -> datetime | None:
+    """Friday strictly before expected_dt, only if it falls within `days_back` days."""
+    wd = expected_dt.weekday()  # Mon=0 .. Fri=4 .. Sun=6
+    if wd == 4:
+        offset = 7
+    elif wd > 4:
+        offset = wd - 4  # Sat=1, Sun=2
+    else:
+        offset = wd + 3  # Mon=3, Tue=4, Wed=5, Thu=6
+    if offset <= days_back:
+        return expected_dt - timedelta(days=offset)
+    return None
+
+
+def _find_next_friday(expected_dt: datetime, days_forward: int) -> datetime | None:
+    """Friday strictly after expected_dt, only if it falls within `days_forward` days."""
+    wd = expected_dt.weekday()
+    if wd == 4:
+        offset = 7
+    elif wd < 4:
+        offset = 4 - wd  # Mon=4, Tue=3, Wed=2, Thu=1
+    else:
+        offset = (4 - wd) + 7  # Sat=6, Sun=5
+    if offset <= days_forward:
+        return expected_dt + timedelta(days=offset)
+    return None
+
+
+def get_spot_price(
+    symbol: str,
+    spot_cache: dict[str, float | None],
+    yf_timeout_sec: float,
+) -> float | None:
+    """Resolve current spot price for a ticker via yfinance with caching."""
+    ticker = symbol.strip().upper()
+    if ticker in spot_cache:
+        return spot_cache[ticker]
+    if yf is None:
+        spot_cache[ticker] = None
+        return None
+
+    def load_spot():
+        t = yf.Ticker(ticker)
+        info = t.info or {}
+        price = (
+            info.get("regularMarketPrice")
+            or info.get("currentPrice")
+            or info.get("previousClose")
+        )
+        if price:
+            return float(price)
+        hist = t.history(period="5d")
+        if hist is not None and len(hist) > 0:
+            return float(hist["Close"].iloc[-1])
+        return None
+
+    price = _run_with_timeout("Spot price lookup", ticker, yf_timeout_sec, load_spot)
+    spot_cache[ticker] = price
+    return price
+
+
+def average_atm_metrics(
+    chain, spot: float, n_each_side: int = 3
+) -> tuple[float | None, float | None]:
+    """Average IV and average open interest across ATM +/- n strikes (calls and puts)."""
+    if chain is None or spot is None or spot <= 0:
+        return (None, None)
+
+    iv_values: list[float] = []
+    oi_values: list[float] = []
+    for df in (getattr(chain, "calls", None), getattr(chain, "puts", None)):
+        if df is None or len(df) == 0:
+            continue
+        if "strike" not in df.columns or "impliedVolatility" not in df.columns:
+            continue
+        sorted_df = df.sort_values("strike").reset_index(drop=True)
+        strikes = sorted_df["strike"].tolist()
+        if not strikes:
+            continue
+        # Index of strike nearest to spot price.
+        atm_idx = min(range(len(strikes)), key=lambda i: abs(strikes[i] - spot))
+        lo = max(0, atm_idx - n_each_side)
+        hi = min(len(strikes) - 1, atm_idx + n_each_side)
+        for i in range(lo, hi + 1):
+            row = sorted_df.iloc[i]
+            try:
+                iv_f = float(row.get("impliedVolatility"))
+            except (TypeError, ValueError):
+                iv_f = float("nan")
+            # Filter NaN (NaN != NaN) and zero/illiquid stale quotes from IV avg only;
+            # OI is averaged across every strike we checked, even if IV is missing.
+            if iv_f == iv_f and iv_f > 0:
+                iv_values.append(iv_f)
+
+            try:
+                oi_raw = row.get("openInterest")
+                oi_f = float(oi_raw) if oi_raw is not None else float("nan")
+            except (TypeError, ValueError):
+                oi_f = float("nan")
+            if oi_f == oi_f and oi_f >= 0:
+                oi_values.append(oi_f)
+
+    avg_iv = sum(iv_values) / len(iv_values) if iv_values else None
+    avg_oi = sum(oi_values) / len(oi_values) if oi_values else None
+    return (avg_iv, avg_oi)
+
+
+def compute_earnings_iv(
+    symbol: str,
+    expected_date: str,
+    iv_cache: dict[tuple[str, str], tuple[str, str, str, str]],
+    spot_cache: dict[str, float | None],
+    expirations_cache: dict[str, tuple[str, ...] | None],
+    yf_timeout_sec: float,
+) -> tuple[str, str, str, str]:
+    """Return (iv_pre, iv_post, iv_ratio_post_pre, oi_post) for weekly options bracketing earnings."""
+    ticker = symbol.strip().upper()
+    expected_dt = parse_date_safe(expected_date)
+    if not ticker or expected_dt is None or yf is None:
+        return ("", "", "", "")
+
+    cache_key = (ticker, expected_date)
+    if cache_key in iv_cache:
+        return iv_cache[cache_key]
+
+    blank = ("", "", "", "")
+
+    pre_friday = _find_prev_friday(expected_dt, days_back=7)
+    post_friday = _find_next_friday(expected_dt, days_forward=6)
+    if pre_friday is None and post_friday is None:
+        iv_cache[cache_key] = blank
+        return blank
+
+    if ticker in expirations_cache:
+        expirations = expirations_cache[ticker]
+    else:
+        def load_expirations():
+            return yf.Ticker(ticker).options
+
+        expirations = _run_with_timeout(
+            "Options expirations lookup", ticker, yf_timeout_sec, load_expirations
+        )
+        expirations_cache[ticker] = expirations
+
+    if not expirations:
+        iv_cache[cache_key] = blank
+        return blank
+
+    available = set(expirations)
+    pre_str = fmt(pre_friday) if pre_friday and fmt(pre_friday) in available else None
+    post_str = fmt(post_friday) if post_friday and fmt(post_friday) in available else None
+    if pre_str is None and post_str is None:
+        iv_cache[cache_key] = blank
+        return blank
+
+    spot = get_spot_price(ticker, spot_cache, yf_timeout_sec)
+    if spot is None or spot <= 0:
+        iv_cache[cache_key] = blank
+        return blank
+
+    def fetch_metrics(exp_date_str: str | None) -> tuple[float | None, float | None]:
+        if not exp_date_str:
+            return (None, None)
+
+        def load_chain():
+            return yf.Ticker(ticker).option_chain(exp_date_str)
+
+        chain = _run_with_timeout(
+            f"Option chain {exp_date_str}", ticker, yf_timeout_sec, load_chain
+        )
+        return average_atm_metrics(chain, spot)
+
+    iv_pre, _ = fetch_metrics(pre_str)
+    iv_post, oi_post = fetch_metrics(post_str)
+
+    iv_pre_s = f"{iv_pre:.4f}" if iv_pre else ""
+    iv_post_s = f"{iv_post:.4f}" if iv_post else ""
+    if iv_pre and iv_post and iv_pre > 0:
+        ratio_s = f"{iv_post / iv_pre:.3f}"
+    else:
+        ratio_s = ""
+    oi_post_s = f"{oi_post:.0f}" if oi_post is not None else ""
+
+    result = (iv_pre_s, iv_post_s, ratio_s, oi_post_s)
+    iv_cache[cache_key] = result
+    return result
+
+
 def accept_yahoo_cookies_once(page, consent_state: dict):
     """Attempt a one-time click on Yahoo's cookie consent accept button."""
     if consent_state.get("handled"):
@@ -491,41 +687,88 @@ def scrape_day(page, week_start: datetime, week_end: datetime, day: datetime, co
     except Exception as e:
         print(f"    [WARN] Could not set rows per page: {e}")
 
-    # Now read all rows (single page)
-    try:
-        page.wait_for_selector("table tbody tr", timeout=10000)
-    except PlaywrightTimeout:
-        print("    no rows.")
-        return []
-
-    rows = page.query_selector_all("table tbody tr")
-    print(f"    {fmt(day)}: {len(rows)} rows")
-
     expected_date = fmt(day)
+    page_num = 1
+    MAX_PAGES = 20
 
-    for row in rows:
-        cells = row.query_selector_all("td")
-        if len(cells) < 3:
-            continue
-        def cell_text(i, _cells=cells):
-            return _cells[i].inner_text().strip() if i < len(_cells) else ""
-        # Scan from the end for the first cell that looks like a market cap
-        mcap_raw = "-"
-        for idx in range(len(cells) - 1, -1, -1):
-            val = cell_text(idx)
-            if re.search(r"[\d.]+\s*[BMTKbmtk]", val):
-                mcap_raw = val
+    while page_num <= MAX_PAGES:
+        try:
+            page.wait_for_selector("table tbody tr", timeout=10000)
+        except PlaywrightTimeout:
+            if page_num == 1:
+                print("    no rows.")
+            break
+
+        rows = page.query_selector_all("table tbody tr")
+        print(f"    {fmt(day)} page {page_num}: {len(rows)} rows")
+
+        # Grab the first row's symbol to detect if Next actually changes the page
+        first_symbol = ""
+        if rows:
+            first_cells = rows[0].query_selector_all("td")
+            if first_cells:
+                first_symbol = first_cells[0].inner_text().strip()
+
+        for row in rows:
+            cells = row.query_selector_all("td")
+            if len(cells) < 3:
+                continue
+            def cell_text(i, _cells=cells):
+                return _cells[i].inner_text().strip() if i < len(_cells) else ""
+            mcap_raw = "-"
+            for idx in range(len(cells) - 1, -1, -1):
+                val = cell_text(idx)
+                if re.search(r"[\d.]+\s*[BMTKbmtk]", val):
+                    mcap_raw = val
+                    break
+            mcap_m = parse_mcap_cell(mcap_raw)
+            mcap_b = f"{mcap_m / 1000:.0f}B" if mcap_m > 0 else "-"
+            rows_data.append({
+                "symbol":        cell_text(0),
+                "company":       cell_text(1),
+                "earnings_date": cell_text(2),
+                "expected_date": expected_date,
+                "market_cap":    mcap_b,
+                "market_cap_m":  mcap_m,
+            })
+
+        # Try to click the "Next" button for more pages
+        has_next = page.evaluate("""
+            () => {
+                const btns = [...document.querySelectorAll('button')];
+                const next = btns.find(b => {
+                    const txt = b.innerText.trim().toLowerCase();
+                    const aria = (b.getAttribute('aria-label') || '').toLowerCase();
+                    return (txt === 'next' || aria.includes('next')
+                            || txt === '›' || txt === '>')
+                           && !b.disabled;
+                });
+                if (next) { next.click(); return true; }
+                return false;
+            }
+        """)
+        if not has_next:
+            break
+
+        # Wait for the table to actually change by checking the first row's symbol
+        page_num += 1
+        changed = False
+        for _ in range(10):
+            time.sleep(1)
+            try:
+                new_rows = page.query_selector_all("table tbody tr")
+                if new_rows:
+                    new_first_cells = new_rows[0].query_selector_all("td")
+                    if new_first_cells:
+                        new_first = new_first_cells[0].inner_text().strip()
+                        if new_first != first_symbol:
+                            changed = True
+                            break
+            except Exception:
                 break
-        mcap_m = parse_mcap_cell(mcap_raw)
-        mcap_b = f"{mcap_m / 1000:.0f}B" if mcap_m > 0 else "-"
-        rows_data.append({
-            "symbol":        cell_text(0),
-            "company":       cell_text(1),
-            "earnings_date": cell_text(2),
-            "expected_date": expected_date,
-            "market_cap":    mcap_b,
-            "market_cap_m":  mcap_m,
-        })
+        if not changed:
+            print(f"    Page did not change after Next click, stopping pagination.")
+            break
 
     print(f"  Total rows collected for {fmt(day)}: {len(rows_data)}")
 
@@ -594,6 +837,9 @@ def scrape_earnings(
     sector_industry_cache: dict[str, tuple[str, str]] = {}
     history_cache = {}
     score_cache = {}
+    iv_cache: dict[tuple[str, str], tuple[str, str, str, str]] = {}
+    spot_cache: dict[str, float | None] = {}
+    expirations_cache: dict[str, tuple[str, ...] | None] = {}
     n_rows = len(unique_rows)
     print(
         f"\nEnriching {n_rows} row(s) "
@@ -620,6 +866,18 @@ def scrape_earnings(
             )
             row["consistency_score_exact"] = exact_score
             row["consistency_score_within1"] = within1_score
+            iv_pre, iv_post, iv_ratio, oi_post = compute_earnings_iv(
+                row.get("symbol", ""),
+                row.get("expected_date", ""),
+                iv_cache,
+                spot_cache,
+                expirations_cache,
+                yf_timeout_sec,
+            )
+            row["iv_pre_earnings"] = iv_pre
+            row["iv_post_earnings"] = iv_post
+            row["iv_ratio_post_pre"] = iv_ratio
+            row["oi_post_earnings"] = oi_post
             if i < n_rows:
                 time.sleep(ENRICHMENT_BACKOFF_SEC)
     except KeyboardInterrupt:
