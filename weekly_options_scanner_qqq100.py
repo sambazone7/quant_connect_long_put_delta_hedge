@@ -4,7 +4,14 @@ from datetime import datetime, timedelta
 # endregion
 
 # ─── Config ───────────────────────────────────────────────────────────────────
-WEEKS_OUT  = 4              # target weeks for expiry (~28 days)
+WEEKS_OUT  = 3              # target weeks for expiry (~21 days)
+
+# Optional explicit scan date. If both YEAR and MONTH are set (MONTH in 1..12),
+# the scanner uses the 1st trading day of that month as "today" and looks for
+# weekly options ~WEEKS_OUT weeks out from there. If either is None, the script
+# falls back to (real today - 2 days), same as before.
+YEAR  = None     # e.g. 2025
+MONTH = None     # 1..12, e.g. 6 for June
 
 TICKERS = [
     "NVDA", "AAPL", "MSFT", "AMZN", "TSLA", "META", "WMT", "GOOGL", "GOOG", "AVGO",
@@ -31,12 +38,20 @@ def _is_monthly(dt):
 class QQQOpenInterestScanner(QCAlgorithm):
 
     def Initialize(self):
-        now = datetime.now().date()
-        scan_day = now - timedelta(days=2)
-        # Roll back to Friday if landing on a weekend
-        while scan_day.weekday() >= 5:
-            scan_day -= timedelta(days=1)
-        end_day = now - timedelta(days=1)
+        if YEAR is not None and MONTH is not None and 1 <= MONTH <= 12:
+            scan_day = datetime(YEAR, MONTH, 1).date()
+            # Roll forward to first weekday of the month
+            while scan_day.weekday() >= 5:
+                scan_day += timedelta(days=1)
+            end_day = scan_day + timedelta(days=5)
+        else:
+            now = datetime.now().date()
+            scan_day = now - timedelta(days=2)
+            # Roll back to Friday if landing on a weekend
+            while scan_day.weekday() >= 5:
+                scan_day -= timedelta(days=1)
+            end_day = now - timedelta(days=1)
+
         self.SetStartDate(scan_day.year, scan_day.month, scan_day.day)
         self.SetEndDate(end_day.year, end_day.month, end_day.day)
         self.SetCash(100_000)
@@ -87,6 +102,13 @@ class QQQOpenInterestScanner(QCAlgorithm):
             if s_price <= 0:
                 continue
 
+            mcap = 0.0
+            try:
+                if equity.Fundamentals is not None:
+                    mcap = equity.Fundamentals.MarketCap or 0.0
+            except Exception:
+                mcap = 0.0
+
             contracts = list(chain)
             if not contracts:
                 continue
@@ -129,6 +151,7 @@ class QQQOpenInterestScanner(QCAlgorithm):
 
             results.append({
                 "ticker":    ticker,
+                "mcap":      mcap,
                 "strike":    atm_strike,
                 "expiry":    chosen_expiry,
                 "put_oi":    put_oi,
@@ -147,15 +170,17 @@ class QQQOpenInterestScanner(QCAlgorithm):
         lines.append(f"QQQ Open Interest Scanner — {today}  (target expiry ~{WEEKS_OUT} weeks out)")
         lines.append(f"Tickers scanned: {len(TICKERS)}  |  Results (weeklies only): {len(results)}")
         lines.append("")
-        hdr = (f"{'#':>3} | {'Ticker':<6} | {'Price':>9} | {'Strike':>9} | {'Expiry':>10}"
+        hdr = (f"{'#':>3} | {'Ticker':<6} | {'MktCap':>12} | {'Price':>9} | {'Strike':>9} | {'Expiry':>10}"
                f" | {'Put OI':>10} | {'Call OI':>10} | {'Total OI':>10}"
                f" | {'Put Vol':>10} | {'Call Vol':>10}")
         lines.append(hdr)
         lines.append("-" * len(hdr))
 
         for i, r in enumerate(results, 1):
+            mcap_b = round(r['mcap'] / 1_000_000_000) if r['mcap'] > 0 else 0
+            mcap_s = f"${mcap_b:>11,}" if mcap_b > 0 else f"{'n/a':>12}"
             lines.append(
-                f"{i:>3} | {r['ticker']:<6} | ${r['price']:>8.2f} | ${r['strike']:>8.2f}"
+                f"{i:>3} | {r['ticker']:<6} | {mcap_s} | ${r['price']:>8.2f} | ${r['strike']:>8.2f}"
                 f" | {r['expiry'].strftime('%Y-%m-%d'):>10}"
                 f" | {r['put_oi']:>10,} | {r['call_oi']:>10,} | {r['total_oi']:>10,}"
                 f" | {r['put_vol']:>10,} | {r['call_vol']:>10,}"

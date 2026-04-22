@@ -56,6 +56,7 @@ with open(args.csvfile, "r", encoding="utf-8", errors="replace") as f:
         vix_en  = parse_float(row.get("vix_entry", ""))
         vix_ex  = parse_float(row.get("vix_exit", ""))
         iv_long = pct(row.get("iv_long_entry", ""))
+        iv_long_exit = pct(row.get("iv_long_exit", ""))
         iv_short = pct(row.get("iv_short_entry", ""))
         stk_chg = parse_signed(row.get("stk_chg_pct", ""))
         stk_max_up = parse_signed(row.get("stk_max_up_pct", ""))
@@ -63,6 +64,8 @@ with open(args.csvfile, "r", encoding="utf-8", errors="replace") as f:
         stk_pnl   = money(row.get("stock_pnl", ""))
         long_pnl  = money(row.get("long_pnl", ""))
         short_pnl = money(row.get("short_pnl", ""))
+        n_cals    = int(row["n_calendars"]) if row.get("n_calendars", "").strip() else (
+                    int(row["n_contracts"]) if row.get("n_contracts", "").strip() else 0)
 
         iv_ratio = None
         if iv_long is not None and iv_short is not None and iv_short > 0:
@@ -75,8 +78,9 @@ with open(args.csvfile, "r", encoding="utf-8", errors="replace") as f:
             "win":         sim_pnl >= 0,
             "vix_entry":   vix_en,
             "vix_exit":    vix_ex,
-            "iv_long":     iv_long,
-            "iv_short":    iv_short,
+            "iv_long":      iv_long,
+            "iv_long_exit": iv_long_exit,
+            "iv_short":     iv_short,
             "iv_ratio":    iv_ratio,
             "stk_chg_pct":    stk_chg,
             "stk_max_up_pct": stk_max_up,
@@ -84,6 +88,7 @@ with open(args.csvfile, "r", encoding="utf-8", errors="replace") as f:
             "stk_pnl":        stk_pnl,
             "long_pnl":    long_pnl,
             "short_pnl":   short_pnl,
+            "n_cals":      n_cals,
             "abs_stk_chg": abs(stk_chg) if stk_chg is not None else None,
         })
 
@@ -311,17 +316,20 @@ sorted_by_sim = sorted(rows, key=lambda r: r["sim_pnl"])
 
 def write_trade_table(label, trade_list):
     out.write(f"\n{label}:\n")
-    hdr = (f"  {'Ticker':<7} {'Earnings':>10}"
+    hdr = (f"  {'Ticker':<7} {'nCal':>10}"
+           f" {'IVLen':>7} {'IVLex':>7}"
            f" {'VIXen':>7} {'VIXex':>7}"
            f" {'IVratio':>8}"
            f" {'MaxUp%':>8} {'MaxDn%':>8} {'StkChg%':>8}"
-           f" {'LongPnL':>14} {'ShortPnL':>14} {'StkPnL':>14}"
+           f" {'LongPnL':>14} {'ShortPnL':>14} {'OptPnL':>14} {'StkPnL':>14}"
            f" {'SimPnL':>14}\n")
     out.write(hdr)
     out.write("  " + "-" * (len(hdr) - 3) + "\n")
     for r in trade_list:
         out.write(
-            f"  {r['ticker']:<7} {r['earnings']:>10}"
+            f"  {r['ticker']:<7} {r['n_cals']:>10}"
+            f" {_fmt(r['iv_long'], '.1%'):>7}"
+            f" {_fmt(r['iv_long_exit'], '.1%'):>7}"
             f" {_fmt(r['vix_entry'], '.1f'):>7}"
             f" {_fmt(r['vix_exit'], '.1f'):>7}"
             f" {_fmt(r['iv_ratio'], '.3f'):>8}"
@@ -330,6 +338,7 @@ def write_trade_table(label, trade_list):
             f" {_fmt(r['stk_chg_pct'], '+.1f', '%'):>8}"
             f" ${r['long_pnl']:>+12,.2f}"
             f" ${r['short_pnl']:>+12,.2f}"
+            f" ${r['long_pnl'] + r['short_pnl']:>+12,.2f}"
             f" ${r['stk_pnl']:>+12,.2f}"
             f" ${r['sim_pnl']:>+12,.2f}"
             f"\n"

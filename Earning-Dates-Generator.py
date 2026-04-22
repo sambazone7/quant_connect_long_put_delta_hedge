@@ -4,10 +4,10 @@ from collections import defaultdict
 import time
 
 tickers = [
-   "AAPL", "GOOGL", "MSFT", "AMZN", "TSLA", "META", "AVGO", "PLTR", "ASML", "NFLX", "AMD", "MU", "CSCO", "ABNB"
+"NIO", "F", "BAC", "GE", "MDT", "PLUG", "WMB", "V", "AAPL", "MSFT", "FCX", "META", "MU", "SIRI", "SLB", "TSLA", "EMR", "KO", "ABBV", "JNJ", "CVX", "NVDA", "EBAY", "MCD", "MRVL", "CSCO", "JPM", "DAL", "AMD", "ELV", "PDD", "MRK", "WFC", "QCOM", "INTC", "XOM", "ACN", "HUYA", "MO", "ADM", "AXP", "FDX", "CRM", "TGT", "PTON", "WMT", "OXY", "ADI", "UAL", "KR", "PYPL", "SBUX", "IBM", "KHC", "NFLX", "ABT", "CRWD", "DE", "PNC", "HD", "WDAY", "ORCL", "SQ", "TEAM", "CAT", "CME", "GLW", "NXPI", "TTD", "BRK.B", "CL", "NSC", "CMCSA", "AIG", "COST", "UPS", "ROKU", "PM", "LULU", "JD", "GILD", "PG", "USB", "LOW", "AMZN", "TXN", "MPC", "DHI", "VLO", "UNH", "MDLZ", "ADP", "CSX", "DD", "YUM", "IQ", "MET", "HES", "LLY", "GS", "CTSH", "LMT", "ADBE", "HON", "OKTA", "SWKS", "AVGO", "PANW", "MA", "BIIB", "BYND", "PEP", "AMGN", "GOOGL", "EOG", "MNST", "RIOT", "AMAT", "CI", "SHOP", "SO", "UNP", "ULTA", "EA", "ED", "ZM", "ETSY", "STZ", "CHWY", "AFL", "VRTX", "ILMN"
 ]
 
-start = datetime(2020, 1, 1)
+start = datetime(2023, 1, 1)
 end   = datetime(2026, 2, 28)
 
 results = defaultdict(list)

@@ -9,7 +9,7 @@ __all__ = [
     "N", "K", "S", "MIN_NET_DEBIT", "SPREAD_CUTOFF_PCT", "DELTA_HEDGE",
     "HEDGE_MODE", "PNL_TOLERANCE", "THETA_K", "MIN_TOLERANCE", "DRIFT_FLOOR", "THETA_WATCHER",
     "D_mult", "RV_SIGMA", "Z",
-    "MAX_PUT_PCT", "PUT_LIMIT_MULT", "N_WEEKLY_AFTER_EARNINGS", "MAX_SHORT_EARN_DAYS", "PRICE_MODEL",
+    "MAX_PUT_PCT", "MIN_MARKET_CAP", "MIN_STOCK_PRICE", "PUT_LIMIT_MULT", "N_WEEKLY_AFTER_EARNINGS", "MAX_SHORT_EARN_DAYS", "PRICE_MODEL",
     "HOURLY_BARS", "TRADE_TIME_MIN", "HEDGE_TIME_MIN", "EXIT_DAYS_BEFORE",
     "FMP_API_KEY", "MANUAL_EARNINGS_DATES",
     "_fetch_earnings_fmp", "_mid",
@@ -38,6 +38,10 @@ D_mult  = 1.0    # (sigma mode) tolerance = D_mult × daily_sigma_frac × |optio
 RV_SIGMA = True   # (sigma mode) True → 30d realized vol; False → long put's live IV
 Z      = 0.0      # IV/RV filter: skip entry if IV/RV >= Z  (0.0 = disabled)
 MAX_PUT_PCT = 0.15  # Sanity: skip entry if long_put_mid > stock_price × MAX_PUT_PCT
+MIN_MARKET_CAP = 0  # Minimum market cap (USD) required to enter a position. 0 = disabled.
+                    # e.g. 10_000_000_000 = skip any ticker with market cap < $10B at entry.
+MIN_STOCK_PRICE = 10  # Minimum stock price (USD) required to enter a position. 0 = disabled.
+                      # Default 10 → skip penny / sub-$10 stocks.
 PUT_LIMIT_MULT = 1.2  # Limit order for long put at long_mid × this (prevents bad fills)
 N_WEEKLY_AFTER_EARNINGS = 1  # Which weekly expiry after earnings for the long put:
                              # 1 → first weekly after earnings, 2 → second weekly, etc.

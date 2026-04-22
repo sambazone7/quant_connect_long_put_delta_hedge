@@ -461,6 +461,27 @@ class EarningsCalendarPutMultiTicker(QCAlgorithm):
             ts["skips_other"] += 1
             return
 
+        # ── Min-stock-price filter ────────────────────────────────────────
+        if MIN_STOCK_PRICE > 0 and s_price < MIN_STOCK_PRICE:
+            self._log(f"  [{ticker}] SKIP — stock price ${s_price:.2f} < "
+                     f"min ${MIN_STOCK_PRICE:.2f}")
+            ts["skips_other"] += 1
+            return
+
+        # ── Market-cap filter ─────────────────────────────────────────────
+        if MIN_MARKET_CAP > 0:
+            mcap = 0.0
+            try:
+                if stock.Fundamentals is not None:
+                    mcap = stock.Fundamentals.MarketCap or 0.0
+            except Exception:
+                mcap = 0.0
+            if mcap > 0 and mcap < MIN_MARKET_CAP:
+                self._log(f"  [{ticker}] SKIP — market cap ${mcap:,.0f} < "
+                         f"min ${MIN_MARKET_CAP:,.0f}")
+                ts["skips_other"] += 1
+                return
+
         result, skip_reason = self._select_calendar_puts(ts["chain"], ed, s_price)
         if result is None:
             self._log(f"  [{ticker}] SKIP no_pair for earnings {ed}: {skip_reason}")
