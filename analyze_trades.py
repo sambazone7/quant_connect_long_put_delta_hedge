@@ -5,7 +5,8 @@ Bucket analysis of parsed trade CSV.
 Usage:
     python analyze_trades.py <input.csv> <output.txt>
 
-Runs eight analyses (all using sim_pnl as the PnL metric):
+Report sections (all using sim_pnl as the PnL metric):
+  TOP 100 BEST & WORST TRADES (sorted by sim_pnl)
   A. IV Percentile at Entry (perc_iv_en) vs sim_pnl
   B. IV/RV Ratio (iv_rv) vs sim_pnl
   C. IV Rank at Entry (ivr) vs sim_pnl
@@ -50,6 +51,137 @@ def load_column(csv_rows, col, pnl_col="sim_pnl", strip_pct=False):
             continue
         pairs.append((val, sim))
     return pairs
+
+
+def _money(s):
+    """Parse a money string, returning float or None on failure."""
+    if s is None:
+        return None
+    s = s.strip().replace(",", "").replace("+", "").replace("$", "")
+    if not s or s == "n/a":
+        return None
+    try:
+        return float(s)
+    except Exception:
+        return None
+
+
+def _pct(s):
+    """Parse a percent string (with or without trailing %), returning float or None."""
+    if s is None:
+        return None
+    s = s.strip().rstrip("%").replace("+", "")
+    if not s or s == "n/a":
+        return None
+    try:
+        return float(s)
+    except Exception:
+        return None
+
+
+def _num(s):
+    """Parse a plain numeric string, returning float or None on failure."""
+    if s is None:
+        return None
+    s = s.strip().replace(",", "")
+    if not s or s == "n/a":
+        return None
+    try:
+        return float(s)
+    except Exception:
+        return None
+
+
+def _int(s):
+    """Parse an integer string, returning int or 0 on failure."""
+    if s is None:
+        return 0
+    s = s.strip().replace(",", "")
+    if not s or s == "n/a":
+        return 0
+    try:
+        return int(float(s))
+    except Exception:
+        return 0
+
+
+def build_typed_rows(csv_rows):
+    """Build a list of typed dicts from raw csv_rows. Skips rows missing sim_pnl."""
+    out_rows = []
+    for r in csv_rows:
+        sim_pnl = _money(r.get("sim_pnl", ""))
+        if sim_pnl is None:
+            continue
+        out_rows.append({
+            "ticker":           r.get("ticker", "").strip(),
+            "earnings":         r.get("earnings", "").strip(),
+            "n_contracts":      _int(r.get("n_contracts", "")),
+            "put_pnl":          _money(r.get("put_pnl", "")),
+            "long_pnl":         _money(r.get("long_pnl", "")),
+            "short_pnl":        _money(r.get("short_pnl", "")),
+            "stock_pnl":        _money(r.get("stock_pnl", "")),
+            "combined":         _money(r.get("combined", "")),
+            "sim_pnl":          sim_pnl,
+            "stk_chg_pct":      _pct(r.get("stk_chg_pct", "")),
+            "iv_entry":         _pct(r.get("iv_entry", "")),
+            "iv_exit":          _pct(r.get("iv_exit", "")),
+            "iv_enter_sample":  _pct(r.get("iv_enter_sample", "")),
+            "iv_exit_sample":   _pct(r.get("iv_exit_sample", "")),
+            "perc_iv_en":       _pct(r.get("perc_iv_en", "")),
+            "perc_iv_ex":       _pct(r.get("perc_iv_ex", "")),
+            "ivr":              _pct(r.get("ivr", "")),
+            "ivrex":            _pct(r.get("ivrex", "")),
+            "vix_entry":        _num(r.get("vix_entry", "")),
+            "vix_exit":         _num(r.get("vix_exit", "")),
+            "iv_rv":            _num(r.get("iv_rv", "")),
+            "shiv_rv":          _num(r.get("shiv_rv", "")),
+            "ivspread":         _num(r.get("ivspread", "")),
+            "iv_change":        _num(r.get("iv_change", "")),
+        })
+    return out_rows
+
+
+def _fmt(v, fmt_str, suffix="", na="n/a"):
+    """Format a value, returning 'n/a' if None."""
+    if v is None:
+        return na
+    return f"{v:{fmt_str}}{suffix}"
+
+
+def _fmt_money(v, width=11):
+    """Format a money value as ' $+1,234' (right-aligned), or n/a centered."""
+    if v is None:
+        return f"{'n/a':>{width + 1}}"
+    return f"${v:>+{width},.0f}"
+
+
+def write_top_table(out, label, trade_list):
+    """Write a top-N best/worst trades table to `out`."""
+    out.write(f"\n{label}:\n")
+    hdr = (f"  {'Ticker':<7} {'Earnings':>10} {'n':>5}"
+           f"  {'Put PnL':>12} {'Stock PnL':>12} {'StkChg%':>8}"
+           f" {'Combined':>12} {'SimPnL':>12}"
+           f"  {'IVent':>7} {'IVexit':>7}"
+           f" {'VIXen':>7} {'VIXex':>7}"
+           f" {'IVR':>6} {'IV/RV':>6} {'Pctl':>5}\n")
+    out.write(hdr)
+    out.write("  " + "-" * (len(hdr) - 3) + "\n")
+    for r in trade_list:
+        put_pnl = r["put_pnl"] if r["put_pnl"] is not None else r["long_pnl"]
+        out.write(
+            f"  {r['ticker']:<7} {r['earnings']:>10} {r['n_contracts']:>5}"
+            f"  {_fmt_money(put_pnl):>12} {_fmt_money(r['stock_pnl']):>12}"
+            f" {_fmt(r['stk_chg_pct'], '+.1f', '%'):>8}"
+            f" {_fmt_money(r['combined']):>12} {_fmt_money(r['sim_pnl']):>12}"
+            f"  {_fmt(r['iv_entry'], '.1f', '%'):>7}"
+            f" {_fmt(r['iv_exit'], '.1f', '%'):>7}"
+            f" {_fmt(r['vix_entry'], '.1f'):>7}"
+            f" {_fmt(r['vix_exit'], '.1f'):>7}"
+            f" {_fmt(r['ivr'], '.1f'):>6}"
+            f" {_fmt(r['iv_rv'], '.2f'):>6}"
+            f" {_fmt(r['perc_iv_en'], '.0f'):>5}"
+            f"\n"
+        )
 
 
 def run_bucket_analysis(out, rows, bucket_defs, metric_name, corr_label):
@@ -123,10 +255,23 @@ def main():
     with open(args.input_csv, encoding="utf-8", errors="replace") as f:
         csv_rows = list(csv.DictReader(f))
 
+    rows = build_typed_rows(csv_rows)
+
     with open(args.output_txt, "w", encoding="utf-8") as out:
         out.write(f"Trade Bucket Analysis — {args.input_csv}\n")
         out.write(f"Total rows in CSV: {len(csv_rows)}\n")
         out.write("=" * 80 + "\n\n")
+
+        # ── TOP 100 BEST & WORST TRADES ─────────────────────────────────────
+        out.write("=" * 80 + "\n")
+        out.write("TOP 100 BEST & WORST TRADES (sorted by sim_pnl)\n")
+        out.write(f"   Valid trades: {len(rows)}\n")
+        out.write("=" * 80 + "\n")
+
+        sorted_by_pnl = sorted(rows, key=lambda r: r["sim_pnl"])
+        write_top_table(out, "TOP 100 WORST TRADES", sorted_by_pnl[:100])
+        write_top_table(out, "TOP 100 BEST TRADES",  sorted_by_pnl[-100:][::-1])
+        out.write("\n\n")
 
         # ── Section A: IV Percentile at Entry ──────────────────────────────
         rows_pctl = load_column(csv_rows, "perc_iv_en")
