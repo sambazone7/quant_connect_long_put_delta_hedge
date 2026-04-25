@@ -1,10 +1,158 @@
 # region imports
 from AlgorithmImports import *
+from cal_config import _mid
 # endregion
 
 # ─── Standalone functions assigned as methods on the algorithm class ──────────
 # Each takes `self` (the algorithm instance) as first arg, so they work
 # identically to regular methods when assigned via class attribute.
+
+
+def _finalize_exit(self, ticker):
+    """Called at the 3:45 PM hedge tick once all exit fills are guaranteed in
+    (any unfilled limits have already been cancelled and market-flattened by
+    the EXITING-state handler in _delta_hedge). Computes PnL from actual
+    fills, writes the trade-log row, runs the POST-EXIT audit, and resets.
+    """
+    ts = self._ts[ticker]
+    if ts["state"] != "EXITING":
+        return  # nothing to finalize (already finalized or never exited)
+
+    n_contracts = ts.get("exit_n_contracts", ts["put_contracts"])
+    put_exit_iv = ts.get("exit_put_iv",      0.0)
+
+    # PnL from actual fill prices (set by OnOrderEvent as fills arrived)
+    long_pnl  = (ts["put_exit_fill"] - ts["put_entry_fill"]) * n_contracts * 100
+    short_pnl = (ts["short_put_entry_fill"] - ts["short_put_exit_fill"]) * n_contracts * 100
+    stk_pnl   = ts["stock_realized"]
+    total_pnl = long_pnl + short_pnl + stk_pnl
+
+    # ── Sim PnL (fair-value exit using intrinsic + call time value) ──
+    s_price      = self.Securities[ts["stock_symbol"]].Price
+    long_strike  = self.Securities[ts["put_symbol"]].Symbol.ID.StrikePrice
+    short_strike = self.Securities[ts["short_put_symbol"]].Symbol.ID.StrikePrice
+    _long_sec    = self.Securities[ts["put_symbol"]]
+
+    if s_price >= long_strike:
+        sim_long_exit = _mid(_long_sec.BidPrice, _long_sec.AskPrice)
+        if sim_long_exit <= 0:
+            # OTM long put with degenerate quote → assume worthless.
+            #
+            # We do NOT attempt put-call parity recovery here. Both the
+            # put and the call on the same strike/expiry come from the
+            # SAME QC option chain bar at the SAME timestamp. If the
+            # put's mid is degenerate (bid=0/ask=0, one-sided, inverted),
+            # the call's mid pulled from the same bar is overwhelmingly
+            # likely to be degenerate too — failure modes are correlated
+            # at the chain-bar level. Parity recovery on co-degenerate
+            # quotes adds noise without information; setting to 0 is the
+            # honest answer for missing data.
+            #
+            # (The ITM branch below DOES still use parity, because there
+            # the put's intrinsic value (long_strike - s_price) is real
+            # money independent of the chain quotes, and parity only
+            # adds a small time-value adjustment from the call's mid.)
+            sim_long_exit = 0.0
+            self._log(f"  [{ticker}] WARN sim_pnl: OTM long put quote degenerate "
+                      f"bid={_long_sec.BidPrice:.2f} ask={_long_sec.AskPrice:.2f} "
+                      f"— assuming sim_long_exit=0")
+    else:
+        call_long_mid = 0.0
+        cl_sym = ts.get("call_symbol_long")
+        if cl_sym and self.Securities.ContainsKey(cl_sym):
+            _cl = self.Securities[cl_sym]
+            call_long_mid = _mid(_cl.BidPrice, _cl.AskPrice)
+            if call_long_mid <= 0:
+                self._log(f"  [{ticker}] WARN sim_pnl: call_long quote degenerate "
+                         f"bid={_cl.BidPrice:.2f} ask={_cl.AskPrice:.2f} — "
+                         f"long put treated as pure intrinsic")
+        else:
+            self._log(f"  [{ticker}] WARN sim_pnl: call_long not subscribed at exit — "
+                     f"long put treated as pure intrinsic")
+        sim_long_exit = (long_strike - s_price) + call_long_mid
+
+    if s_price >= short_strike:
+        sim_short_exit = 0.0
+    else:
+        sim_short_exit = short_strike - s_price
+
+    # Allow sim_long_exit == 0 (worthless long put is a valid sim outcome).
+    # Only skip if long-put entry fill is missing (no reference price for PnL).
+    if ts["put_entry_fill"] > 0:
+        sim_pnl = ((sim_long_exit - ts["put_entry_fill"])
+                 - (sim_short_exit - ts["short_put_entry_fill"])) * n_contracts * 100 + stk_pnl
+    else:
+        sim_pnl = 0.0
+
+    # Stock % change + final max-deviation update
+    entry_px = ts["stock_entry_price"]
+    exit_px  = self.Securities[ts["stock_symbol"]].Price
+    stk_chg_pct = ((exit_px - entry_px) / entry_px * 100) if entry_px > 0 else 0.0
+    if entry_px > 0:
+        _dev = (exit_px - entry_px) / entry_px * 100
+        ts["stock_max_up_pct"] = max(ts["stock_max_up_pct"], _dev)
+        ts["stock_max_dn_pct"] = min(ts["stock_max_dn_pct"], _dev)
+
+    ed = ts["entry_earnings"].date()
+
+    _short_iv = ts["short_put_entry_iv"]
+    _long_iv  = ts["put_entry_iv"]
+    _rv       = ts["entry_rv"]
+    _iv_spread = _long_iv - _short_iv
+    _short_iv_rv = _short_iv / _rv if _rv > 0 else 0.0
+
+    self._log(f"  [{ticker}] EXIT: LongPnL=${long_pnl:+,.2f} "
+             f"ShortPnL=${short_pnl:+,.2f} StkPnL=${stk_pnl:+,.2f} "
+             f"Total=${total_pnl:+,.2f} "
+             f"IVspread={_iv_spread:.1%} ShortIV/RV={_short_iv_rv:.2f}")
+
+    ts["trade_log"].append({
+        "earnings":           ed,
+        "n_contracts":        n_contracts,
+        "long_pnl":           long_pnl,
+        "short_pnl":          short_pnl,
+        "stk_pnl":            stk_pnl,
+        "stk_max_up_pct":     ts["stock_max_up_pct"],
+        "stk_max_dn_pct":     ts["stock_max_dn_pct"],
+        "stk_chg_pct":        stk_chg_pct,
+        "total":              total_pnl,
+        "sim_pnl":            sim_pnl,
+        "vix_entry":          ts["vix_entry"],
+        "vix_exit":           ts["vix_exit"],
+        "iv_entry":           _long_iv,
+        "iv_exit":            put_exit_iv,
+        "rv":                 _rv,
+        "iv_spread_entry":    _long_iv - _short_iv,
+        "short_iv_entry":     _short_iv,
+        "short_iv_rv":        _short_iv / _rv if _rv > 0 else 0.0,
+        "long_spread_entry":  ts["long_spread_entry"],
+        "short_spread_entry": ts["short_spread_entry"],
+        "long_spread_exit":   ts["long_spread_exit"],
+        "short_spread_exit":  ts["short_spread_exit"],
+        "hedge_count":        ts["hedge_count"],
+        "short_put_entry_px": ts["short_put_entry_fill"],
+        "short_put_exit_px":  ts["short_put_exit_fill"],
+        "long_put_entry_px":  ts["put_entry_fill"],
+        "long_put_exit_px":   ts["put_exit_fill"],
+    })
+
+    # ── Post-exit reconciliation: verify portfolio is actually flat ────
+    for lbl, sym in [("long_put", ts["put_symbol"]),
+                     ("short_put", ts["short_put_symbol"]),
+                     ("stock", ts["stock_symbol"])]:
+        if sym is None:
+            continue
+        try:
+            rem = self.Portfolio[sym].Quantity \
+                  if self.Portfolio.ContainsKey(sym) else 0
+        except Exception:
+            rem = 0
+        if rem != 0:
+            self._log(f"  [{ticker}] POST-EXIT WARNING: {lbl} still has {rem} "
+                     f"units after exit — positions not flat!")
+
+    ts["traded_earnings"].add(ed)
+    self._reset(ticker)
 
 
 def _immediate_close_all(self, ticker, reason):

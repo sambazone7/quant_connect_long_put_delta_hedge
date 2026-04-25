@@ -4,7 +4,17 @@ from collections import defaultdict
 import time
 
 tickers = [
-"NIO", "F", "BAC", "GE", "MDT", "PLUG", "WMB", "V", "AAPL", "MSFT", "FCX", "META", "MU", "SIRI", "SLB", "TSLA", "EMR", "KO", "ABBV", "JNJ", "CVX", "NVDA", "EBAY", "MCD", "MRVL", "CSCO", "JPM", "DAL", "AMD", "ELV", "PDD", "MRK", "WFC", "QCOM", "INTC", "XOM", "ACN", "HUYA", "MO", "ADM", "AXP", "FDX", "CRM", "TGT", "PTON", "WMT", "OXY", "ADI", "UAL", "KR", "PYPL", "SBUX", "IBM", "KHC", "NFLX", "ABT", "CRWD", "DE", "PNC", "HD", "WDAY", "ORCL", "SQ", "TEAM", "CAT", "CME", "GLW", "NXPI", "TTD", "BRK.B", "CL", "NSC", "CMCSA", "AIG", "COST", "UPS", "ROKU", "PM", "LULU", "JD", "GILD", "PG", "USB", "LOW", "AMZN", "TXN", "MPC", "DHI", "VLO", "UNH", "MDLZ", "ADP", "CSX", "DD", "YUM", "IQ", "MET", "HES", "LLY", "GS", "CTSH", "LMT", "ADBE", "HON", "OKTA", "SWKS", "AVGO", "PANW", "MA", "BIIB", "BYND", "PEP", "AMGN", "GOOGL", "EOG", "MNST", "RIOT", "AMAT", "CI", "SHOP", "SO", "UNP", "ULTA", "EA", "ED", "ZM", "ETSY", "STZ", "CHWY", "AFL", "VRTX", "ILMN"
+
+"NVDA","AAPL","WBD","AMZN","META","TSLA","INTC","MSFT","GOOGL","BAC",
+"RIVN","MRK","AMD","TSM","WMT","META","GM","WFC","JD","AVGO",
+"MDT","OXY","T","ORCL","PYPL","NKE","MU","DIS","MTCH","KO",
+"JPM","PANW","FCX","PDD","IBM","XOM","PG","CMCSA","VZ","SNOW",
+"CMG","JNJ","V","CRM","WMB","NOW","LCID","QCOM","ADBE","MRVL",
+"CVX","AMAT","CSCO","GE","NEE","SLB","TTWO","CRWD","MNST","BSX",
+"CSX","TXN","ABBV","ATVI","SCHW","KR","MO","MCD","COST","WDAY",
+"HD","LLY","FDX","CAT","LOW","AZN","SO","TJX","KMB","MS",
+"AXP","LRCX","RTX","SBUX","DDOG","PEP","BIDU","FANG","AIG","USB",
+"VLO","GS","DOW","GEHC","ZS","UPS","EA","COF","MA","AMGN"
 ]
 
 start = datetime(2023, 1, 1)

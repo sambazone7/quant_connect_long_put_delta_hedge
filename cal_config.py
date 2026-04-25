@@ -9,7 +9,9 @@ __all__ = [
     "N", "K", "S", "MIN_NET_DEBIT", "SPREAD_CUTOFF_PCT", "DELTA_HEDGE",
     "HEDGE_MODE", "PNL_TOLERANCE", "THETA_K", "MIN_TOLERANCE", "DRIFT_FLOOR", "THETA_WATCHER",
     "D_mult", "RV_SIGMA", "Z",
-    "MAX_PUT_PCT", "MIN_MARKET_CAP", "MIN_STOCK_PRICE", "PUT_LIMIT_MULT", "N_WEEKLY_AFTER_EARNINGS", "MAX_SHORT_EARN_DAYS", "PRICE_MODEL",
+    "MAX_PUT_PCT", "MIN_MARKET_CAP", "MIN_STOCK_PRICE", "PUT_LIMIT_MULT",
+    "SHORT_PUT_LIMIT_MULT", "EXIT_LIMIT_MULT_LONG", "EXIT_LIMIT_MULT_SHORT",
+    "N_WEEKLY_AFTER_EARNINGS", "MAX_SHORT_EARN_DAYS", "PRICE_MODEL",
     "HOURLY_BARS", "TRADE_TIME_MIN", "HEDGE_TIME_MIN", "EXIT_DAYS_BEFORE",
     "FMP_API_KEY", "MANUAL_EARNINGS_DATES",
     "_fetch_earnings_fmp", "_mid",
@@ -38,11 +40,21 @@ D_mult  = 1.0    # (sigma mode) tolerance = D_mult × daily_sigma_frac × |optio
 RV_SIGMA = True   # (sigma mode) True → 30d realized vol; False → long put's live IV
 Z      = 0.0      # IV/RV filter: skip entry if IV/RV >= Z  (0.0 = disabled)
 MAX_PUT_PCT = 0.15  # Sanity: skip entry if long_put_mid > stock_price × MAX_PUT_PCT
-MIN_MARKET_CAP = 0  # Minimum market cap (USD) required to enter a position. 0 = disabled.
-                    # e.g. 10_000_000_000 = skip any ticker with market cap < $10B at entry.
+MIN_MARKET_CAP = 20_000_000  # Minimum market cap (USD) required to enter a position. 0 = disabled.
+                             # e.g. 10_000_000_000 = skip any ticker with market cap < $10B at entry.
+                             # 20_000_000 = $20M (filters out micro-/nano-cap names with thin chains)
 MIN_STOCK_PRICE = 10  # Minimum stock price (USD) required to enter a position. 0 = disabled.
                       # Default 10 → skip penny / sub-$10 stocks.
-PUT_LIMIT_MULT = 1.2  # Limit order for long put at long_mid × this (prevents bad fills)
+# ── Limit-order multipliers ───────────────────────────────────────────────────
+# All four legs use LimitOrder + MidPriceFillModel (which fills at next-bar mid
+# only if the limit is permissive enough). Wider buffers ⇒ higher mid-fill rate;
+# tighter buffers ⇒ stronger circuit-breaker against degenerate quotes / gaps.
+# Recommended liberal-buffer profile (~99% mid fills, market fallback only on
+# extreme moves):
+PUT_LIMIT_MULT        = 1.5  # Long  entry BUY  limit @ long_mid  × 1.5 (pay up to 1.5×)
+SHORT_PUT_LIMIT_MULT  = 0.5  # Short entry SELL limit @ short_mid × 0.5 (accept down to 0.5×)
+EXIT_LIMIT_MULT_LONG  = 0.5  # Long  exit  SELL limit @ long_mid  × 0.5 (accept down to 0.5×)
+EXIT_LIMIT_MULT_SHORT = 1.5  # Short exit  BUY  limit @ short_mid × 1.5 (pay up to 1.5×)
 N_WEEKLY_AFTER_EARNINGS = 1  # Which weekly expiry after earnings for the long put:
                              # 1 → first weekly after earnings, 2 → second weekly, etc.
 MAX_SHORT_EARN_DAYS = 7      # Max calendar days between short put expiry and earnings date
@@ -53,8 +65,10 @@ PRICE_MODEL = "default"   # Option pricing model for Greeks: "BT" | "BS" | "defa
                           # default = QC built-in (no explicit model set)
 HOURLY_BARS = False       # True  → Resolution.Hour  (fast, ~50x fewer data points)
                           # False → Resolution.Minute (precise fills, slower)
-TRADE_TIME_MIN = 270      # Minutes after market open to enter/exit trades
-                          # 270 → 2:00 PM ET,  210 → 1:00 PM ET,  330 → 3:00 PM ET
+TRADE_TIME_MIN = 180      # Minutes after market open to enter/exit trades
+                          # 180 → 12:30 PM ET (half-day-safe; ~30 min before 1 PM close)
+                          # 270 → 2:00 PM ET (skipped on half-days — market already closed)
+                          # 210 → 1:00 PM ET,  330 → 3:00 PM ET
 HEDGE_TIME_MIN = 15       # Minutes before market close to run delta hedge
                           # 15 → 3:45 PM ET,  30 → 3:30 PM ET
 EXIT_DAYS_BEFORE = 1      # Trading days before short put expiry to close position

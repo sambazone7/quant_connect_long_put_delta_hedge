@@ -13,6 +13,7 @@ class EarningsCalendarPutMultiTicker(QCAlgorithm):
     _emergency_exit         = _h._emergency_exit
     _finalize_emergency_exit = _h._finalize_emergency_exit
     _check_orphaned_positions = _h._check_orphaned_positions
+    _finalize_exit          = _h._finalize_exit
     """
     
     """
@@ -70,8 +71,15 @@ class EarningsCalendarPutMultiTicker(QCAlgorithm):
                 "put_entry_iv":         0.0,      # IV of long put at entry
                 "short_put_entry_iv":   0.0,      # IV of short put at entry
                 "put_order_ticket":     None,     # limit order ticket for long put
+                "short_put_order_ticket": None,   # limit order ticket for short put (entry)
+                "long_exit_ticket":     None,     # limit order ticket for long put (exit)
+                "short_exit_ticket":    None,     # limit order ticket for short put (exit)
                 "pending_short_put":    False,    # True until short put placed after long put fills
                 "pending_hedge_shares": 0,
+                "entry_aborted":        False,    # True if short never filled at mid → unwinding long
+                "exit_n_contracts":     0,        # snapshot for _finalize_exit
+                "exit_n_shares":        0,        # snapshot for _finalize_exit
+                "exit_put_iv":          0.0,      # snapshot for _finalize_exit
                 "stock_qty":            0,
                 "stock_cost_basis":     0.0,
                 "stock_realized":       0.0,
@@ -238,7 +246,7 @@ class EarningsCalendarPutMultiTicker(QCAlgorithm):
         fill_qty   = orderEvent.FillQuantity   # +buy / −sell
 
         for ticker, ts in self._ts.items():
-            if ts["state"] not in ("ACTIVE", "EMERGENCY_PENDING"):
+            if ts["state"] not in ("ACTIVE", "EMERGENCY_PENDING", "EXITING"):
                 continue
 
             # ── Long put fill ────────────────────────────────────────
@@ -247,22 +255,44 @@ class EarningsCalendarPutMultiTicker(QCAlgorithm):
                     ts["put_entry_fill"] = fill_price
                     # Deferred: sell short put now that long put is filled
                     if ts.get("pending_short_put"):
-                        self._filling_ticker = ticker
-                        self.MarketOrder(ts["short_put_symbol"], -ts["put_contracts"])
-                        self._filling_ticker = None
-                        ts["pending_short_put"] = False
-                    # Deferred: place stock hedge
-                    pending = ts.get("pending_hedge_shares", 0)
-                    if pending != 0:
-                        self._filling_ticker = ticker
-                        self.MarketOrder(ts["stock_symbol"], pending)
-                        self._filling_ticker = None
-                        ts["pending_hedge_shares"] = 0
+                        short_sec = self.Securities[ts["short_put_symbol"]]
+                        short_mid_now = _mid(short_sec.BidPrice, short_sec.AskPrice)
+                        if short_mid_now <= 0:
+                            # Degenerate short quote → ABORT entry: unwind the long we just bought
+                            self._log(f"  [{ticker}] ABORT entry: short_put quote degenerate "
+                                      f"(bid={short_sec.BidPrice:.2f} ask={short_sec.AskPrice:.2f}) "
+                                      f"— unwinding long put")
+                            ts["entry_aborted"] = True
+                            ts["pending_short_put"]    = False
+                            ts["pending_hedge_shares"] = 0
+                            self._filling_ticker = ticker
+                            self.MarketOrder(ts["put_symbol"], -ts["put_contracts"])
+                            self._filling_ticker = None
+                            # _reset() will run when the unwind sell-fill comes back below
+                        else:
+                            short_limit_px = round(short_mid_now * SHORT_PUT_LIMIT_MULT, 2)
+                            self._filling_ticker = ticker
+                            st_ticket = self.LimitOrder(
+                                ts["short_put_symbol"], -ts["put_contracts"], short_limit_px)
+                            self._filling_ticker = None
+                            ts["short_put_order_ticket"] = st_ticket
+                            ts["pending_short_put"] = False
+                    # NOTE: stock hedge is now deferred to the short-fill branch below,
+                    # so both put legs are open before we hedge delta.
                 else:
                     ts["put_exit_fill"] = fill_price
                     if ts.get("force_exited"):
                         if not ts.get("_closing_forced"):
                             self._finalize_forced_exit(ticker)
+                        return
+                    # Entry-unwind sell (short never filled at mid) → just reset
+                    if ts.get("entry_aborted"):
+                        self._log(f"  [{ticker}] Entry-unwind long put sold at "
+                                  f"${fill_price:.2f} — resetting (no trade-log row)")
+                        self._reset(ticker)
+                        return
+                    # During our own EXITING flow → record fill, no warning
+                    if ts["state"] == "EXITING":
                         return
                     # Detect auto-liquidation: long put sold but NOT by our code
                     if self._filling_ticker != ticker:
@@ -276,12 +306,22 @@ class EarningsCalendarPutMultiTicker(QCAlgorithm):
                 if fill_qty < 0:
                     # We sold the short put (entry)
                     ts["short_put_entry_fill"] = fill_price
+                    # Deferred: place stock hedge now that BOTH put legs are open
+                    pending = ts.get("pending_hedge_shares", 0)
+                    if pending != 0:
+                        self._filling_ticker = ticker
+                        self.MarketOrder(ts["stock_symbol"], pending)
+                        self._filling_ticker = None
+                        ts["pending_hedge_shares"] = 0
                 else:
                     # We bought back the short put (exit) — likely ASSIGNMENT
                     ts["short_put_exit_fill"] = fill_price
                     if ts.get("force_exited"):
                         if not ts.get("_closing_forced"):
                             self._finalize_forced_exit(ticker)
+                        return
+                    # During our own EXITING flow → record fill, no warning
+                    if ts["state"] == "EXITING":
                         return
                     # Detect assignment / auto-liquidation of short put
                     if self._filling_ticker != ticker:
@@ -346,6 +386,16 @@ class EarningsCalendarPutMultiTicker(QCAlgorithm):
             return
 
         today = self.Time.date()
+
+        # Re-pin all four contracts daily — guards against QC universe drops
+        # mid-trade (esp. the calls used for sim_pnl at exit via put-call parity).
+        if ts["state"] == "ACTIVE":
+            _res = Resolution.Hour if HOURLY_BARS else Resolution.Minute
+            for _key in ("put_symbol", "short_put_symbol",
+                         "call_symbol_long", "call_symbol_short"):
+                _sym = ts.get(_key)
+                if _sym is not None:
+                    self.AddOptionContract(_sym, _res)
 
         # ── Check exit: EXIT_DAYS_BEFORE trading days before short put expiry ──
         if ts["state"] == "ACTIVE" and ts.get("short_put_expiry"):
@@ -620,6 +670,12 @@ class EarningsCalendarPutMultiTicker(QCAlgorithm):
     # ── Exit ──────────────────────────────────────────────────────────────────
 
     def _exit_position(self, ticker):
+        """Request exit: places LIMIT orders at mid for both put legs (with
+        market-order fallback for degenerate quotes), market order for stock,
+        and sets state=EXITING. PnL computation + trade-log row are deferred
+        to _finalize_exit(), called at the 3:45 PM hedge tick once any
+        unfilled limits have been cancelled and market-flattened.
+        """
         ts = self._ts[ticker]
         if ts["state"] != "ACTIVE":
             return
@@ -638,143 +694,108 @@ class EarningsCalendarPutMultiTicker(QCAlgorithm):
                     except Exception:
                         put_exit_iv = 0.0
                     break
+        ts["exit_put_iv"] = put_exit_iv
 
-        # Save quantities before orders (OnOrderEvent will update them)
+        # Snapshot quantities before orders (OnOrderEvent will update them as fills arrive)
         n_contracts = ts["put_contracts"]
         n_shares    = ts["stock_qty"]
+        ts["exit_n_contracts"] = n_contracts
+        ts["exit_n_shares"]    = n_shares
 
-        # Record exit bid-ask spread costs before closing
+        # Record exit bid-ask spread costs from current quotes
         try:
             _long_sec  = self.Securities[ts["put_symbol"]]
             ts["long_spread_exit"] = round(abs(_long_sec.BidPrice - _long_sec.AskPrice) * 100 * n_contracts)
         except Exception:
+            _long_sec = None
             ts["long_spread_exit"] = 0
         try:
             _short_sec = self.Securities[ts["short_put_symbol"]]
             ts["short_spread_exit"] = round(abs(_short_sec.BidPrice - _short_sec.AskPrice) * 100 * n_contracts)
         except Exception:
+            _short_sec = None
             ts["short_spread_exit"] = 0
 
-        # Close all three legs — OnOrderEvent captures actual fill prices
+        # ── Place LIMIT orders at mid for both put legs ────────────────────
+        # Stock hedge stays as MarketOrder (liquid, MidPriceFillModel overrides to mid).
+        # If a put quote is degenerate (mid <= 0), fall back to MarketOrder for that leg.
         self._filling_ticker = ticker
-        if n_contracts > 0:
-            self.MarketOrder(ts["put_symbol"], -n_contracts)          # sell long put
+        ts["state"] = "EXITING"   # signals OnOrderEvent that fills are exits, not assignments
+
+        if n_contracts > 0 and _long_sec is not None:
+            long_mid_now = _mid(_long_sec.BidPrice, _long_sec.AskPrice)
+            if long_mid_now > 0:
+                long_limit_px = round(long_mid_now * EXIT_LIMIT_MULT_LONG, 2)
+                lt = self.LimitOrder(ts["put_symbol"], -n_contracts, long_limit_px)
+                ts["long_exit_ticket"] = lt
+            else:
+                self._log(f"  [{ticker}] EXIT: long_mid degenerate "
+                          f"(bid={_long_sec.BidPrice:.2f} ask={_long_sec.AskPrice:.2f}) "
+                          f"— falling back to MarketOrder for long put")
+                self.MarketOrder(ts["put_symbol"], -n_contracts)
+                ts["long_exit_ticket"] = None
+
             # Only buy back short put if we actually hold it (may already be assigned)
             short_qty = 0
             if self.Portfolio.ContainsKey(ts["short_put_symbol"]):
                 short_qty = self.Portfolio[ts["short_put_symbol"]].Quantity
-            if short_qty != 0:
-                self.MarketOrder(ts["short_put_symbol"], -short_qty)
+            if short_qty != 0 and _short_sec is not None:
+                short_mid_now = _mid(_short_sec.BidPrice, _short_sec.AskPrice)
+                if short_mid_now > 0:
+                    short_limit_px = round(short_mid_now * EXIT_LIMIT_MULT_SHORT, 2)
+                    st = self.LimitOrder(ts["short_put_symbol"], -short_qty, short_limit_px)
+                    ts["short_exit_ticket"] = st
+                else:
+                    self._log(f"  [{ticker}] EXIT: short_mid degenerate "
+                              f"(bid={_short_sec.BidPrice:.2f} ask={_short_sec.AskPrice:.2f}) "
+                              f"— falling back to MarketOrder for short put")
+                    self.MarketOrder(ts["short_put_symbol"], -short_qty)
+                    ts["short_exit_ticket"] = None
+            else:
+                ts["short_exit_ticket"] = None
+        else:
+            ts["long_exit_ticket"]  = None
+            ts["short_exit_ticket"] = None
+
         if n_shares != 0:
             self.MarketOrder(ts["stock_symbol"], -n_shares)
         self._filling_ticker = None
 
-        # PnL from actual fill prices (set by OnOrderEvent)
-        long_pnl  = (ts["put_exit_fill"] - ts["put_entry_fill"]) * n_contracts * 100
-        short_pnl = (ts["short_put_entry_fill"] - ts["short_put_exit_fill"]) * n_contracts * 100
-        stk_pnl   = ts["stock_realized"]
-        total_pnl = long_pnl + short_pnl + stk_pnl
-
-        # ── Sim PnL (fair-value exit using intrinsic + call time value) ──
-        s_price      = self.Securities[ts["stock_symbol"]].Price
-        long_strike  = self.Securities[ts["put_symbol"]].Symbol.ID.StrikePrice
-        short_strike = self.Securities[ts["short_put_symbol"]].Symbol.ID.StrikePrice
-
-        if s_price >= long_strike:
-            sim_long_exit = _mid(_long_sec.BidPrice, _long_sec.AskPrice)
-        else:
-            call_long_mid = 0.0
-            cl_sym = ts.get("call_symbol_long")
-            if cl_sym and self.Securities.ContainsKey(cl_sym):
-                _cl = self.Securities[cl_sym]
-                call_long_mid = _mid(_cl.BidPrice, _cl.AskPrice)
-            sim_long_exit = (long_strike - s_price) + call_long_mid
-
-        if s_price >= short_strike:
-            sim_short_exit = 0.0
-        else:
-            sim_short_exit = short_strike - s_price
-
-        if sim_long_exit > 0 and ts["put_entry_fill"] > 0:
-            sim_pnl = ((sim_long_exit - ts["put_entry_fill"])
-                     - (sim_short_exit - ts["short_put_entry_fill"])) * n_contracts * 100 + stk_pnl
-        else:
-            sim_pnl = 0.0
-
-        # Stock % change + final max-deviation update
-        entry_px = ts["stock_entry_price"]
-        exit_px  = self.Securities[ts["stock_symbol"]].Price
-        stk_chg_pct = ((exit_px - entry_px) / entry_px * 100) if entry_px > 0 else 0.0
-        if entry_px > 0:
-            _dev = (exit_px - entry_px) / entry_px * 100
-            ts["stock_max_up_pct"] = max(ts["stock_max_up_pct"], _dev)
-            ts["stock_max_dn_pct"] = min(ts["stock_max_dn_pct"], _dev)
-
-        ed = ts["entry_earnings"].date()
-
-        _short_iv = ts["short_put_entry_iv"]
-        _long_iv  = ts["put_entry_iv"]
-        _rv       = ts["entry_rv"]
-        _iv_spread = _long_iv - _short_iv
-        _short_iv_rv = _short_iv / _rv if _rv > 0 else 0.0
-
-        self._log(f"  [{ticker}] EXIT: LongPnL=${long_pnl:+,.2f} "
-                 f"ShortPnL=${short_pnl:+,.2f} StkPnL=${stk_pnl:+,.2f} "
-                 f"Total=${total_pnl:+,.2f} "
-                 f"IVspread={_iv_spread:.1%} ShortIV/RV={_short_iv_rv:.2f}")
-
-        ts["trade_log"].append({
-            "earnings":           ed,
-            "n_contracts":        n_contracts,
-            "long_pnl":           long_pnl,
-            "short_pnl":          short_pnl,
-            "stk_pnl":            stk_pnl,
-            "stk_max_up_pct":     ts["stock_max_up_pct"],
-            "stk_max_dn_pct":     ts["stock_max_dn_pct"],
-            "stk_chg_pct":        stk_chg_pct,
-            "total":              total_pnl,
-            "sim_pnl":            sim_pnl,
-            "vix_entry":          ts["vix_entry"],
-            "vix_exit":           ts["vix_exit"],
-            "iv_entry":           _long_iv,
-            "iv_exit":            put_exit_iv,
-            "rv":                 _rv,
-            "iv_spread_entry":    _long_iv - _short_iv,
-            "short_iv_entry":     _short_iv,
-            "short_iv_rv":        _short_iv / _rv if _rv > 0 else 0.0,
-            "long_spread_entry":  ts["long_spread_entry"],
-            "short_spread_entry": ts["short_spread_entry"],
-            "long_spread_exit":   ts["long_spread_exit"],
-            "short_spread_exit":  ts["short_spread_exit"],
-            "hedge_count":        ts["hedge_count"],
-            "short_put_entry_px": ts["short_put_entry_fill"],
-            "short_put_exit_px":  ts["short_put_exit_fill"],
-            "long_put_entry_px":  ts["put_entry_fill"],
-            "long_put_exit_px":   ts["put_exit_fill"],
-        })
-
-        # ── Post-exit reconciliation: verify portfolio is actually flat ────
-        for lbl, sym in [("long_put", ts["put_symbol"]),
-                         ("short_put", ts["short_put_symbol"]),
-                         ("stock", ts["stock_symbol"])]:
-            if sym is None:
-                continue
-            try:
-                rem = self.Portfolio[sym].Quantity \
-                      if self.Portfolio.ContainsKey(sym) else 0
-            except Exception:
-                rem = 0
-            if rem != 0:
-                self._log(f"  [{ticker}] POST-EXIT WARNING: {lbl} still has {rem} "
-                         f"units after exit — positions not flat!")
-
-        ts["traded_earnings"].add(ed)
-        self._reset(ticker)
+        self._log(f"  [{ticker}] EXIT REQUESTED: limits placed "
+                  f"(long_ticket={'Y' if ts['long_exit_ticket'] else 'mkt-fallback'} "
+                  f"short_ticket={'Y' if ts['short_exit_ticket'] else 'mkt-fallback/none'}) "
+                  f"— finalize at hedge tick")
 
     # ── Delta hedge: combined calendar delta (before close) ───────────────────
 
     def _delta_hedge(self, ticker):
         ts = self._ts[ticker]
+
+        # ── EXITING state: cancel any unfilled exit limit orders, market-flatten,
+        #    then finalize PnL + trade-log row. By the time this runs (3:45 PM)
+        #    limit orders have had ~1h45m to fill at mid. Anything still open
+        #    must be force-flattened so we're not naked over weekend / holiday.
+        if ts["state"] == "EXITING":
+            for tkt_key, sym_key in [
+                ("long_exit_ticket",  "put_symbol"),
+                ("short_exit_ticket", "short_put_symbol"),
+            ]:
+                tkt = ts.get(tkt_key)
+                if tkt is not None and tkt.Status not in (
+                        OrderStatus.Filled, OrderStatus.Canceled, OrderStatus.Invalid):
+                    tkt.Cancel()
+                    sym = ts.get(sym_key)
+                    qty = (self.Portfolio[sym].Quantity
+                           if sym and self.Portfolio.ContainsKey(sym) else 0)
+                    if qty != 0:
+                        self._log(f"  [{ticker}] EXIT FALLBACK: limit unfilled, "
+                                  f"market-flattening {qty} of {sym}")
+                        self._filling_ticker = ticker
+                        self.MarketOrder(sym, -qty)
+                        self._filling_ticker = None
+            # All 3 legs are now guaranteed flat (or recorded). Finalize.
+            self._finalize_exit(ticker)
+            return
 
         # ── Cancel unfilled long put limit order if still pending ─────────
         if ts["state"] == "ACTIVE" and ts.get("put_entry_fill", 0) == 0:
@@ -803,18 +824,42 @@ class EarningsCalendarPutMultiTicker(QCAlgorithm):
                 self._reset(ticker)
                 return
 
-        # ── Warm-up: if exit is tomorrow, re-subscribe both puts now ─────
-        if ts["state"] == "ACTIVE" and ts.get("short_put_expiry"):
-            today = self.Time.date()
-            exit_day = self._offset_trading_days(ticker, ts["short_put_expiry"], -EXIT_DAYS_BEFORE)
-            if exit_day is not None:
-                tomorrow = self._offset_trading_days(ticker, today, 1)
-                if tomorrow == exit_day:
-                    _res = Resolution.Hour if HOURLY_BARS else Resolution.Minute
-                    if ts.get("put_symbol"):
-                        self.AddOptionContract(ts["put_symbol"], _res)
-                    if ts.get("short_put_symbol"):
-                        self.AddOptionContract(ts["short_put_symbol"], _res)
+        # ── Cancel unfilled short put limit order if long is filled but short isn't ─
+        # Long is in (paid debit) but short never filled at mid → unwind the long via
+        # market order so we don't carry a naked long over close. No trade-log row
+        # is written because the entry was incomplete.
+        if (ts["state"] == "ACTIVE"
+                and ts.get("put_entry_fill", 0) > 0
+                and ts.get("short_put_entry_fill", 0) == 0
+                and not ts.get("entry_aborted")):
+            st_ticket = ts.get("short_put_order_ticket")
+            if st_ticket is not None:
+                st_ticket.Cancel()
+                self._log(f"  [{ticker}] Short put limit did not fill — "
+                          f"unwinding long put + resetting (no trade-log row)")
+                ts["entry_aborted"] = True
+                # Sell back the long put we already own (entry-unwind branch in
+                # OnOrderEvent will call _reset when this fill comes back).
+                self._filling_ticker = ticker
+                self.MarketOrder(ts["put_symbol"], -ts["put_contracts"])
+                self._filling_ticker = None
+                # Safety net: nothing else should be open (stock hedge was deferred
+                # to short-fill branch), but flatten anything that snuck through.
+                for sym_key in ("short_put_symbol", "stock_symbol"):
+                    sym = ts.get(sym_key)
+                    if sym is None:
+                        continue
+                    try:
+                        qty = self.Portfolio[sym].Quantity \
+                              if self.Portfolio.ContainsKey(sym) else 0
+                    except Exception:
+                        qty = 0
+                    if qty != 0:
+                        self._log(f"  [{ticker}] CANCEL SAFETY: closing {qty} of {sym}")
+                        self._filling_ticker = ticker
+                        self.MarketOrder(sym, -qty)
+                        self._filling_ticker = None
+                return
 
         if ts["state"] != "ACTIVE" or ts["chain"] is None:
             return
@@ -998,8 +1043,15 @@ class EarningsCalendarPutMultiTicker(QCAlgorithm):
         ts["put_entry_iv"]        = 0.0
         ts["short_put_entry_iv"]  = 0.0
         ts["put_order_ticket"]    = None
+        ts["short_put_order_ticket"] = None
+        ts["long_exit_ticket"]    = None
+        ts["short_exit_ticket"]   = None
         ts["pending_short_put"]   = False
         ts["pending_hedge_shares"]= 0
+        ts["entry_aborted"]       = False
+        ts["exit_n_contracts"]    = 0
+        ts["exit_n_shares"]       = 0
+        ts["exit_put_iv"]         = 0.0
         ts["stock_qty"]           = 0
         ts["stock_cost_basis"]    = 0.0
         ts["stock_realized"]      = 0.0

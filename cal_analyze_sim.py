@@ -3,11 +3,14 @@
 Analyse calendar-spread trades CSV for sim_pnl relationships.
 
 Focuses on: VIX entry, IV long/short ratio, |stock change %|, and short-leg IV vs sim_pnl.
+Also includes a monthly P&L breakdown (filtered: IV/RV < 1.5 AND VIX at entry < 25)
+using sim_pnl, with Trades / Wins / Win% / Avg / Total / Cumulative columns.
 
 Usage:
     python cal_analyze_sim.py <input.csv> <output.out>
 """
-import csv, sys, statistics, argparse
+import csv, sys, re, statistics, argparse
+from collections import defaultdict
 
 parser = argparse.ArgumentParser(description="Analyse sim_pnl relationships in calendar-spread trades")
 parser.add_argument("csvfile", help="Input trades CSV (from cal_parse_log.py)")
@@ -64,6 +67,7 @@ with open(args.csvfile, "r", encoding="utf-8", errors="replace") as f:
         stk_pnl   = money(row.get("stock_pnl", ""))
         long_pnl  = money(row.get("long_pnl", ""))
         short_pnl = money(row.get("short_pnl", ""))
+        iv_rv     = parse_float(row.get("iv_rv", ""))
         n_cals    = int(row["n_calendars"]) if row.get("n_calendars", "").strip() else (
                     int(row["n_contracts"]) if row.get("n_contracts", "").strip() else 0)
 
@@ -88,6 +92,7 @@ with open(args.csvfile, "r", encoding="utf-8", errors="replace") as f:
             "stk_pnl":        stk_pnl,
             "long_pnl":    long_pnl,
             "short_pnl":   short_pnl,
+            "iv_rv":       iv_rv,
             "n_cals":      n_cals,
             "abs_stk_chg": abs(stk_chg) if stk_chg is not None else None,
         })
@@ -346,6 +351,83 @@ def write_trade_table(label, trade_list):
 
 write_trade_table("TOP 100 WORST TRADES", sorted_by_sim[:100])
 write_trade_table("TOP 100 BEST TRADES", sorted_by_sim[-100:][::-1])
+out.write("\n")
+
+# ════════════════════════════════════════════════════════════════════════════
+# 7. MONTHLY PnL (filtered: IV/RV < 1.5 AND VIX at entry < 25)
+# ════════════════════════════════════════════════════════════════════════════
+
+out.write("=" * 80 + "\n")
+out.write("7. MONTHLY PnL  (filtered: IV/RV < 1.5 AND VIX at entry < 25)\n")
+out.write("=" * 80 + "\n\n")
+
+MONTH_NAMES = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
+               "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+monthly_data = defaultdict(lambda: {"pnl": 0.0, "trades": 0, "wins": 0})
+monthly_skipped = 0
+
+for r in rows:
+    if r["iv_rv"] is None or r["vix_entry"] is None:
+        monthly_skipped += 1
+        continue
+    ym_match = re.match(r"(\d{4})-(\d{2})", r["earnings"])
+    if not ym_match:
+        monthly_skipped += 1
+        continue
+    if r["iv_rv"] < 1.5 and r["vix_entry"] < 25:
+        ym_key = ym_match.group(0)
+        monthly_data[ym_key]["pnl"] += r["sim_pnl"]
+        monthly_data[ym_key]["trades"] += 1
+        if r["win"]:
+            monthly_data[ym_key]["wins"] += 1
+
+if monthly_data:
+    all_yms = sorted(monthly_data.keys())
+    first_year = int(all_yms[0][:4])
+    last_year  = int(all_yms[-1][:4])
+
+    hdr = (f"  {'Month':<12} {'Trades':>6} {'Wins':>5} {'Win%':>6} "
+           f"{'Avg PnL':>10} {'Total PnL':>12} {'Cumulative':>12}\n")
+    out.write(hdr)
+    out.write("  " + "-" * (len(hdr) - 3) + "\n")
+
+    cumulative   = 0.0
+    total_trades = 0
+    total_wins   = 0
+    total_pnl    = 0.0
+    for year in range(first_year, last_year + 1):
+        for month in range(1, 13):
+            ym = f"{year}-{month:02d}"
+            label = f"{year} {MONTH_NAMES[month - 1]}"
+            d = monthly_data.get(ym)
+            if d and d["trades"] > 0:
+                cumulative   += d["pnl"]
+                total_trades += d["trades"]
+                total_wins   += d["wins"]
+                total_pnl    += d["pnl"]
+                win_pct = d["wins"] / d["trades"] * 100
+                avg_pnl = d["pnl"] / d["trades"]
+                out.write(
+                    f"  {label:<12} {d['trades']:>6} {d['wins']:>5} "
+                    f"{win_pct:>5.1f}% {avg_pnl:>+10,.0f} "
+                    f"{d['pnl']:>+12,.0f} {cumulative:>+12,.0f}\n"
+                )
+            else:
+                out.write(f"  {label:<12} {'0':>6}\n")
+
+    out.write("  " + "-" * (len(hdr) - 3) + "\n")
+    if total_trades > 0:
+        overall_win_pct = total_wins / total_trades * 100
+        overall_avg     = total_pnl / total_trades
+        out.write(
+            f"  {'TOTAL':<12} {total_trades:>6} {total_wins:>5} "
+            f"{overall_win_pct:>5.1f}% {overall_avg:>+10,.0f} "
+            f"{total_pnl:>+12,.0f} {cumulative:>+12,.0f}\n"
+        )
+    out.write(f"\n  Skipped (missing iv_rv/vix/earnings): {monthly_skipped}\n")
+else:
+    out.write("  (no valid data — need iv_rv, vix_entry, sim_pnl, earnings columns)\n")
+
 out.write("\n")
 
 out.close()
