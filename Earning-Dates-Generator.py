@@ -5,16 +5,16 @@ import time
 
 tickers = [
 
-"NVDA","AAPL","WBD","AMZN","META","TSLA","INTC","MSFT","GOOGL","BAC",
-"RIVN","MRK","AMD","TSM","WMT","META","GM","WFC","JD","AVGO",
-"MDT","OXY","T","ORCL","PYPL","NKE","MU","DIS","MTCH","KO",
-"JPM","PANW","FCX","PDD","IBM","XOM","PG","CMCSA","VZ","SNOW",
-"CMG","JNJ","V","CRM","WMB","NOW","LCID","QCOM","ADBE","MRVL",
-"CVX","AMAT","CSCO","GE","NEE","SLB","TTWO","CRWD","MNST","BSX",
-"CSX","TXN","ABBV","ATVI","SCHW","KR","MO","MCD","COST","WDAY",
-"HD","LLY","FDX","CAT","LOW","AZN","SO","TJX","KMB","MS",
-"AXP","LRCX","RTX","SBUX","DDOG","PEP","BIDU","FANG","AIG","USB",
-"VLO","GS","DOW","GEHC","ZS","UPS","EA","COF","MA","AMGN"
+"NVDA","AAPL","SOFI","WBD","AMZN","TSLA","PLTR","MSFT","GOOG","GOOGL",
+"RIVN","AMD","OPEN","META","HOOD","JD","UPST","RXRX","AVGO","PYPL",
+"MU","SMCI","MTCH","PANW","COIN","PDD","AFRM","CMCSA","SNOW","AI",
+"SQ","LCID","QCOM","ADBE","MRVL","AMAT","SHOP","CSCO","U","TTWO",
+"ENPH","CRWD","MNST","RBLX","TXN","MRNA","NET","COST","ARM","WDAY",
+"ROKU","EDIT","AZN","DUOL","LRCX","DDOG","PEP","BIDU","TOST","FANG",
+"TWLO","GEHC","CELH","ZS","EA","FSLR","AMGN","EBAY","DLTR","FTNT",
+"ABNB","TMUS","ON","SRPT","SPLK","APP","OKTA","DOCU","MAR","SIRI",
+"MDB","ASML","VRTX","ADI","SEDG","ALGN","TEAM","CHTR","DXCM","CRSP",
+"HON","ROST","NTAP","ISRG","BILL","INTU","GILD","NXPI","BKNG","GH"
 ]
 
 start = datetime(2023, 1, 1)

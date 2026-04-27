@@ -154,6 +154,27 @@ def write_quintile(key, sorted_rows, fmt_pct=False):
             out.write(f"  Q{qi+1}      {lo_v:>8.2f} -  {hi_v:>7.2f}   {nq:>5} ${total:>+14,.2f} ${avg:>+12,.2f} ${med:>+12,.2f}   {wins/nq:.1%}\n")
     out.write("\n")
 
+def write_ticker_rank_table(label, ranked_list):
+    """Render a per-ticker rankings table. ranked_list is already sorted; each
+    record carries: ticker, n, wins, total, avg, median, best, worst,
+    avg_iv_short."""
+    out.write(f"\n{label}:\n")
+    hdr = (f"  {'Rank':>4}  {'Ticker':<7}  {'Trades':>6}  {'Wins':>4}  {'Win%':>6}  "
+           f"{'AvgShIV':>8}  "
+           f"{'Total SimPnL':>16}  {'Avg SimPnL':>14}  {'Median SimPnL':>15}  "
+           f"{'Best Trade':>14}  {'Worst Trade':>14}\n")
+    out.write(hdr)
+    out.write("  " + "-" * (len(hdr) - 3) + "\n")
+    for i, r in enumerate(ranked_list, 1):
+        win_pct = (r["wins"] / r["n"] * 100) if r["n"] > 0 else 0.0
+        sh_iv   = f"{r['avg_iv_short']:>7.1%}" if r["avg_iv_short"] is not None else f"{'n/a':>8}"
+        out.write(
+            f"  {i:>4}  {r['ticker']:<7}  {r['n']:>6}  {r['wins']:>4}  {win_pct:>5.1f}%  "
+            f"{sh_iv:>8}  "
+            f"${r['total']:>+15,.2f}  ${r['avg']:>+13,.2f}  ${r['median']:>+14,.2f}  "
+            f"${r['best']:>+13,.2f}  ${r['worst']:>+13,.2f}\n"
+        )
+
 # ════════════════════════════════════════════════════════════════════════════
 # 1. OVERALL SUMMARY
 # ════════════════════════════════════════════════════════════════════════════
@@ -427,6 +448,53 @@ if monthly_data:
     out.write(f"\n  Skipped (missing iv_rv/vix/earnings): {monthly_skipped}\n")
 else:
     out.write("  (no valid data — need iv_rv, vix_entry, sim_pnl, earnings columns)\n")
+
+out.write("\n")
+
+# ════════════════════════════════════════════════════════════════════════════
+# 8. TICKER RANKINGS BY TOTAL SIM_PNL
+# ════════════════════════════════════════════════════════════════════════════
+
+out.write("=" * 80 + "\n")
+out.write("8. TICKER RANKINGS BY TOTAL SIM_PNL\n")
+out.write("   Aggregated across all trades per ticker.  Sort key: total sim_pnl.\n")
+out.write("=" * 80 + "\n\n")
+
+ticker_stats = defaultdict(lambda: {"n": 0, "wins": 0, "total": 0.0,
+                                    "pnls": [], "iv_shorts": []})
+for r in rows:
+    t = r["ticker"]
+    if not t:
+        continue
+    ticker_stats[t]["n"]     += 1
+    ticker_stats[t]["wins"]  += 1 if r["win"] else 0
+    ticker_stats[t]["total"] += r["sim_pnl"]
+    ticker_stats[t]["pnls"].append(r["sim_pnl"])
+    if r["iv_short"] is not None:
+        ticker_stats[t]["iv_shorts"].append(r["iv_short"])
+
+ticker_records = [{
+    "ticker":       t,
+    "n":            d["n"],
+    "wins":         d["wins"],
+    "total":        d["total"],
+    "avg":          d["total"] / d["n"],
+    "median":       statistics.median(d["pnls"]),
+    "best":         max(d["pnls"]),
+    "worst":        min(d["pnls"]),
+    "avg_iv_short": (sum(d["iv_shorts"]) / len(d["iv_shorts"])) if d["iv_shorts"] else None,
+} for t, d in ticker_stats.items()]
+
+if ticker_records:
+    out.write(f"Universe: {len(ticker_records)} unique tickers, {len(rows)} trades total\n")
+
+    best_50  = sorted(ticker_records, key=lambda r: r["total"], reverse=True)[:50]
+    worst_50 = sorted(ticker_records, key=lambda r: r["total"])[:50]
+
+    write_ticker_rank_table("TOP 50 BEST TICKERS (by total sim_pnl)",  best_50)
+    write_ticker_rank_table("TOP 50 WORST TICKERS (by total sim_pnl)", worst_50)
+else:
+    out.write("  (no ticker data available)\n")
 
 out.write("\n")
 

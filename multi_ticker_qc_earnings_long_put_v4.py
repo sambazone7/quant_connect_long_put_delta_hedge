@@ -396,6 +396,7 @@ class EarningsLongPutMultiTickerV2(QCAlgorithm):
                                  f"putPnL=${put_pnl:+,.0f} stkPnL=${stk_pnl:+,.0f} "
                                  f"total=${total:+,.0f}")
                         ts["hedge_count"] = 0
+                        ts["traded_earnings"].add(ed)
                         self._reset(ticker)
                         return
                     # Detect auto-liquidation: put sold but NOT by our code
@@ -812,7 +813,12 @@ class EarningsLongPutMultiTickerV2(QCAlgorithm):
                 self._reset(ticker)
                 return
 
-        if ts["state"] != "ACTIVE" or ts["chain"] is None:
+        # Skip live-hedge during force-exit window: between QC's auto-liquidation
+        # MOC submission (force_exited=True, stock already closed) and the put
+        # fill arriving back through OnOrderEvent. State is still "ACTIVE" in
+        # that window but reading Greeks / placing fresh stock orders would be
+        # spurious (position is being torn down).
+        if ts["state"] != "ACTIVE" or ts["chain"] is None or ts.get("force_exited"):
             return
 
         stock   = self.Securities[ts["stock_symbol"]]
