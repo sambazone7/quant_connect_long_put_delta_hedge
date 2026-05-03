@@ -4,16 +4,34 @@ from datetime import timedelta, date as Date
 import math
 from cal_config import *
 import cal_exit_handlers as _h
+import cal_greeks as _g
+import cal_helpers as _u
+from cal_greeks import bs_put_greeks, IVSmoother
 # endregion
 
 
 class EarningsCalendarPutMultiTicker(QCAlgorithm):
-    _immediate_close_all    = _h._immediate_close_all
-    _finalize_forced_exit   = _h._finalize_forced_exit
-    _emergency_exit         = _h._emergency_exit
-    _finalize_emergency_exit = _h._finalize_emergency_exit
+    # Exit / emergency handlers
+    _immediate_close_all      = _h._immediate_close_all
+    _finalize_forced_exit     = _h._finalize_forced_exit
+    _emergency_exit           = _h._emergency_exit
+    _finalize_emergency_exit  = _h._finalize_emergency_exit
     _check_orphaned_positions = _h._check_orphaned_positions
-    _finalize_exit          = _h._finalize_exit
+    _finalize_exit            = _h._finalize_exit
+    # Greeks helpers (custom Black-Scholes path + IV smoothing)
+    _get_risk_free_rate       = _g._get_risk_free_rate
+    _get_dividend_yield       = _g._get_dividend_yield
+    _sample_iv_for_smoothers  = _g._sample_iv_for_smoothers
+    # Utility helpers (earnings loading, RV, VIX, trading-day math, state reset)
+    _load_earnings_dates      = _u._load_earnings_dates
+    _log_earnings_dates       = _u._log_earnings_dates
+    _calc_realized_vol        = _u._calc_realized_vol
+    _get_vix                  = _u._get_vix
+    _offset_trading_days      = _u._offset_trading_days
+    _reset                    = _u._reset
+    _log                      = _u._log
+    _ol                       = _u._ol
+    OnEndOfAlgorithm          = _u.OnEndOfAlgorithm
     """
     
     """
@@ -35,6 +53,15 @@ class EarningsCalendarPutMultiTicker(QCAlgorithm):
         self._total_fees = 0.0     # accumulated fees across all tickers and orders
         self._theta_exits = 0      # count of trades closed by THETA_WATCHER
         self._vix_symbol = self.AddData(CBOE, "VIX", Resolution.Daily).Symbol
+
+        # ── Custom-greeks support (see cal_greeks.py + cal_config.py) ──
+        # Risk-free rate model handle (used by _get_risk_free_rate)
+        try:
+            self._risk_free_model = self.RiskFreeInterestRateModel
+        except Exception:
+            self._risk_free_model = None
+        # Per-ticker dividend-yield cache: ticker → (yield, last_refresh_date)
+        self._dividend_yields = {}
 
         _exp_max = K * 2 + 20   # broad enough to capture weeklies around earnings
 
@@ -111,6 +138,9 @@ class EarningsCalendarPutMultiTicker(QCAlgorithm):
                 "skips_no_pair":      0,    # _select_calendar_puts returned None (no weeklies / spread too wide)
                 "skips_low_debit":    0,    # net_debit <= 0 or < MIN_NET_DEBIT
                 "skips_other":        0,    # chain missing, bad price, MAX_PUT_PCT, IV/RV filter
+                # ── Custom-greeks IV smoothers (None until trade activation) ──
+                "long_iv_smoother":   None,
+                "short_iv_smoother":  None,
             }
 
             # Scheduled events — capture ticker in default arg
@@ -130,37 +160,6 @@ class EarningsCalendarPutMultiTicker(QCAlgorithm):
                 lambda t=ticker: self._check_orphaned_positions(t),
             )
 
-    # ── Earnings date loading ─────────────────────────────────────────────────
-
-    def _load_earnings_dates(self, ticker):
-        try:
-            start = Date(self.StartDate.year,  self.StartDate.month,  self.StartDate.day)
-        except AttributeError:
-            start = Date(self.StartDate.Year,  self.StartDate.Month,  self.StartDate.Day)
-        try:
-            end   = Date(self.EndDate.year,    self.EndDate.month,    self.EndDate.day)
-        except AttributeError:
-            end   = Date(self.EndDate.Year,    self.EndDate.Month,    self.EndDate.Day)
-
-        combined = []
-        manual   = MANUAL_EARNINGS_DATES.get(ticker, [])
-        if manual:
-            in_window = [d for d in manual if start <= d.date() <= end]
-            combined.extend(in_window)
-
-        if FMP_API_KEY:
-            try:
-                fmp_dates = _fetch_earnings_fmp(ticker, N, FMP_API_KEY, start, end)
-                combined.extend(fmp_dates)
-            except Exception:
-                pass
-
-        combined = sorted(set(combined))
-        return combined[-N:] if N and len(combined) > N else combined
-
-    def _log_earnings_dates(self, ticker, dates):
-        pass  # suppressed — summary printed in OnEndOfAlgorithm
-
     # ── Fill model ────────────────────────────────────────────────────────────
 
     def OnSecuritiesChanged(self, changes):
@@ -173,6 +172,16 @@ class EarningsCalendarPutMultiTicker(QCAlgorithm):
         for ticker, ts in self._ts.items():
             if ts["option_symbol"] in data.OptionChains:
                 ts["chain"] = data.OptionChains[ts["option_symbol"]]
+
+                # ── Bar-level IV sampling for custom-greeks smoothers ──
+                # Runs every bar an ACTIVE position has a refreshed chain so
+                # the rolling 5-day IV averages have ~390 samples/day to work
+                # with (minute resolution). Long & short legs are smoothed
+                # in fully separate buffers — never mingled.
+                if (COMPUTE_OWN_GREEKS
+                        and ts["state"] == "ACTIVE"
+                        and ts.get("long_iv_smoother") is not None):
+                    self._sample_iv_for_smoothers(ticker, ts)
 
             # ── Stock split detection ───────────────────────────────────
             if data.Splits.ContainsKey(ts["stock_symbol"]):
@@ -387,6 +396,26 @@ class EarningsCalendarPutMultiTicker(QCAlgorithm):
 
         today = self.Time.date()
 
+        # ── Underlying-tradable guard ────────────────────────────────
+        # If the stock has been delisted mid-trade (acquisition close,
+        # reverse merger, exchange suspension, etc.), QC throws on
+        # AddOptionContract / chain lookups for that symbol. Rather than
+        # crash, mark the position force_exited and defer finalization to
+        # QC's natural MOC auto-liquidation, which OnOrderEvent's
+        # SUBMITTED handler (lines 190-232) already catches and converts
+        # into a proper trade-log row via _finalize_forced_exit.
+        stock_sym = ts.get("stock_symbol")
+        stock_sec = (self.Securities[stock_sym]
+                     if stock_sym and self.Securities.ContainsKey(stock_sym)
+                     else None)
+        if stock_sec is None or not stock_sec.IsTradable:
+            if ts["state"] == "ACTIVE" and not ts.get("force_exited"):
+                ts["force_exited"] = True
+                self._log(f"  [{self.Time.date()}] [{ticker}] underlying "
+                          f"delisted/untradable — deferring to QC auto-"
+                          f"liquidation MOC for finalization")
+            return
+
         # Re-pin all four contracts daily — guards against QC universe drops
         # mid-trade (esp. the calls used for sim_pnl at exit via put-call parity).
         if ts["state"] == "ACTIVE":
@@ -395,7 +424,19 @@ class EarningsCalendarPutMultiTicker(QCAlgorithm):
                          "call_symbol_long", "call_symbol_short"):
                 _sym = ts.get(_key)
                 if _sym is not None:
-                    self.AddOptionContract(_sym, _res)
+                    try:
+                        self.AddOptionContract(_sym, _res)
+                    except Exception as e:
+                        # Belt-and-suspenders: if the underlying gets delisted
+                        # between the IsTradable check above and this call
+                        # (or AddOptionContract throws for any other reason),
+                        # treat it the same — force-exit + defer to QC MOC.
+                        if not ts.get("force_exited"):
+                            ts["force_exited"] = True
+                            self._log(f"  [{self.Time.date()}] [{ticker}] "
+                                      f"AddOptionContract failed for {_key}: "
+                                      f"{e} — deferring to QC auto-liquidation")
+                        return
 
         # ── Check exit: EXIT_DAYS_BEFORE trading days before short put expiry ──
         if ts["state"] == "ACTIVE" and ts.get("short_put_expiry"):
@@ -615,6 +656,17 @@ class EarningsCalendarPutMultiTicker(QCAlgorithm):
         ts["entry_rv"]            = rv
         ts["long_spread_entry"]   = round(abs(long_put.BidPrice - long_put.AskPrice) * 100 * n_contracts)
         ts["short_spread_entry"]  = round(abs(short_put.BidPrice - short_put.AskPrice) * 100 * n_contracts)
+
+        # ── Per-leg IV smoothers (used by _delta_hedge if COMPUTE_OWN_GREEKS=True) ──
+        # Long and short legs have distinct IV regimes (long spans earnings → carries
+        # event premium; short expires before earnings → no event premium). They are
+        # smoothed in fully separate buffers and never mingled.
+        if COMPUTE_OWN_GREEKS:
+            ts["long_iv_smoother"]  = IVSmoother(window_days=IV_SMOOTH_DAYS)
+            ts["short_iv_smoother"] = IVSmoother(window_days=IV_SMOOTH_DAYS)
+            # Seed each buffer with its own entry IV (already validated by entry filters).
+            ts["long_iv_smoother"].seed(cur_iv,    self.Time)
+            ts["short_iv_smoother"].seed(short_iv, self.Time)
 
         # ── Pin both contracts so the universe filter can never unsubscribe them ──
         # Also set NullAssignmentModel on each contract individually — the
@@ -879,20 +931,79 @@ class EarningsCalendarPutMultiTicker(QCAlgorithm):
         long_delta = long_gamma = long_theta = None
         short_delta = short_gamma = short_theta = None
         cur_iv = 0.0
+        cur_short_iv = 0.0
 
-        for c in ts["chain"]:
-            if c.Symbol == ts["put_symbol"]:
-                long_delta = c.Greeks.Delta
-                long_gamma = c.Greeks.Gamma
-                long_theta = c.Greeks.Theta
+        if (COMPUTE_OWN_GREEKS
+                and ts.get("long_iv_smoother")  is not None
+                and ts.get("short_iv_smoother") is not None):
+            # ── Custom Black-Scholes greeks fed by per-leg smoothed IV ──
+            # Each leg's smoother only ever sees its OWN IV samples — the
+            # long and short IV histories are kept fully separate and
+            # never mingled. See cal_greeks.IVSmoother.
+            long_smooth  = ts["long_iv_smoother"].current_smooth()
+            short_smooth = ts["short_iv_smoother"].current_smooth()
+            if long_smooth is None or short_smooth is None:
+                # Buffers should have at least the entry seed; this is a
+                # safety net. Nothing usable to compute greeks from.
+                return
+
+            r = self._get_risk_free_rate()
+            q = self._get_dividend_yield(ts["stock_symbol"])
+            T_long  = (ts["put_symbol"].ID.Date       - self.Time).total_seconds() / (365.25 * 86400)
+            T_short = (ts["short_put_symbol"].ID.Date - self.Time).total_seconds() / (365.25 * 86400)
+            g_long  = bs_put_greeks(s_price, ts["put_symbol"].ID.StrikePrice,
+                                    T_long,  r, q, long_smooth)
+            g_short = bs_put_greeks(s_price, ts["short_put_symbol"].ID.StrikePrice,
+                                    T_short, r, q, short_smooth)
+            long_delta,  long_gamma,  long_theta  = g_long["delta"],  g_long["gamma"],  g_long["theta"]
+            short_delta, short_gamma, short_theta = g_short["delta"], g_short["gamma"], g_short["theta"]
+            cur_iv       = long_smooth
+            cur_short_iv = short_smooth
+
+            if GREEKS_VERBOSE:
+                # Side-by-side custom-vs-QC sanity log (validation phase).
+                qc_ld = qc_sd = qc_lg = qc_sg = None
                 try:
-                    cur_iv = c.ImpliedVolatility
+                    for c in ts["chain"]:
+                        if c.Symbol == ts["put_symbol"]:
+                            qc_ld, qc_lg = c.Greeks.Delta, c.Greeks.Gamma
+                        elif c.Symbol == ts.get("short_put_symbol"):
+                            qc_sd, qc_sg = c.Greeks.Delta, c.Greeks.Gamma
                 except Exception:
-                    cur_iv = 0.0
-            elif c.Symbol == ts.get("short_put_symbol"):
-                short_delta = c.Greeks.Delta
-                short_gamma = c.Greeks.Gamma
-                short_theta = c.Greeks.Theta
+                    pass
+                self._log(
+                    f"  [{ticker}] GREEKS custom L_d={long_delta:.4f} S_d={short_delta:.4f} "
+                    f"L_g={long_gamma:.4f} S_g={short_gamma:.4f} "
+                    f"L_iv={long_smooth:.3f} S_iv={short_smooth:.3f} "
+                    f"| QC L_d={qc_ld} S_d={qc_sd} L_g={qc_lg} S_g={qc_sg} "
+                    f"| smooth_n L={ts['long_iv_smoother'].sample_count()} "
+                    f"S={ts['short_iv_smoother'].sample_count()}"
+                )
+                self._log(
+                    f"  [{ticker}] IV-SMOOTH long: {ts['long_iv_smoother'].reject_summary()}"
+                )
+                self._log(
+                    f"  [{ticker}] IV-SMOOTH short: {ts['short_iv_smoother'].reject_summary()}"
+                )
+        else:
+            # ── QC-greeks path (original behaviour) ──
+            for c in ts["chain"]:
+                if c.Symbol == ts["put_symbol"]:
+                    long_delta = c.Greeks.Delta
+                    long_gamma = c.Greeks.Gamma
+                    long_theta = c.Greeks.Theta
+                    try:
+                        cur_iv = c.ImpliedVolatility
+                    except Exception:
+                        cur_iv = 0.0
+                elif c.Symbol == ts.get("short_put_symbol"):
+                    short_delta = c.Greeks.Delta
+                    short_gamma = c.Greeks.Gamma
+                    short_theta = c.Greeks.Theta
+                    try:
+                        cur_short_iv = c.ImpliedVolatility
+                    except Exception:
+                        cur_short_iv = 0.0
 
         if long_delta is None or long_delta == 0.0:
             return   # long put not in chain or stale — cannot compute delta
@@ -963,7 +1074,16 @@ class EarningsCalendarPutMultiTicker(QCAlgorithm):
                     return
                 daily_sigma_frac = rv / (252 ** 0.5)
             else:
-                sigma_iv = cur_iv if cur_iv > 0 else ts["put_entry_iv"]
+                # Short-leg IV is the closest forward-looking projection of the
+                # underlying's near-term realized vol — its time-to-expiry is
+                # the smallest, so it best estimates "what's expected to happen
+                # tomorrow," which is exactly what the daily delta-hedge band
+                # needs to anticipate. Fall back to long-leg live IV → short
+                # entry IV → long entry IV in that order if quotes are stale.
+                sigma_iv = (cur_short_iv if cur_short_iv > 0
+                            else cur_iv if cur_iv > 0
+                            else ts.get("short_put_entry_iv", 0.0) or
+                                 ts.get("put_entry_iv", 0.0))
                 if sigma_iv <= 0:
                     return
                 daily_sigma_frac = sigma_iv / (252 ** 0.5)
@@ -989,280 +1109,7 @@ class EarningsCalendarPutMultiTicker(QCAlgorithm):
         ts["hedge_count"] += 1
         ts["last_hedge_price"] = s_price
 
-    # ── Helpers ───────────────────────────────────────────────────────────────
-
-    def _offset_trading_days(self, ticker, ref_date, offset_days):
-        """Return the date offset_days trading days from ref_date."""
-        d    = ref_date if isinstance(ref_date, Date) else ref_date.date()
-        step = -1 if offset_days < 0 else 1
-        left = abs(offset_days)
-        exch = self.Securities[self._ts[ticker]["stock_symbol"]].Exchange
-        while left > 0:
-            d += timedelta(days=step)
-            if exch.Hours.IsDateOpen(d):
-                left -= 1
-        return d
-
-    def _calc_realized_vol(self, symbol, lookback_days=30):
-        """Compute annualized realized volatility from daily log returns."""
-        try:
-            hist = self.History(symbol, timedelta(days=lookback_days), Resolution.Daily)
-            if hist is None or hist.empty:
-                return 0.0
-            closes = hist['close'].tolist()
-            if len(closes) < 2:
-                return 0.0
-            log_rets = [math.log(closes[i] / closes[i - 1]) for i in range(1, len(closes))]
-            mean = sum(log_rets) / len(log_rets)
-            var  = sum((r - mean) ** 2 for r in log_rets) / max(len(log_rets) - 1, 1)
-            return (var ** 0.5) * (252 ** 0.5)
-        except Exception:
-            return 0.0
-
-    def _get_vix(self):
-        """Fetch most recent VIX close via History() with 5-day lookback."""
-        try:
-            h = self.History(self._vix_symbol, 5, Resolution.Daily)
-            if not h.empty:
-                return float(h["close"].iloc[-1])
-        except Exception:
-            pass
-        return None
-
-    def _reset(self, ticker):
-        ts = self._ts[ticker]
-        ts["state"]               = "FLAT"
-        ts["put_symbol"]          = None
-        ts["short_put_symbol"]    = None
-        ts["put_contracts"]       = 0
-        ts["put_entry_fill"]      = 0.0
-        ts["put_exit_fill"]       = 0.0
-        ts["short_put_entry_fill"]= 0.0
-        ts["short_put_exit_fill"] = 0.0
-        ts["short_put_expiry"]    = None
-        ts["put_entry_iv"]        = 0.0
-        ts["short_put_entry_iv"]  = 0.0
-        ts["put_order_ticket"]    = None
-        ts["short_put_order_ticket"] = None
-        ts["long_exit_ticket"]    = None
-        ts["short_exit_ticket"]   = None
-        ts["pending_short_put"]   = False
-        ts["pending_hedge_shares"]= 0
-        ts["entry_aborted"]       = False
-        ts["exit_n_contracts"]    = 0
-        ts["exit_n_shares"]       = 0
-        ts["exit_put_iv"]         = 0.0
-        ts["stock_qty"]           = 0
-        ts["stock_cost_basis"]    = 0.0
-        ts["stock_realized"]      = 0.0
-        ts["last_hedge_price"]    = 0.0
-        ts["stock_entry_price"]   = 0.0
-        ts["stock_max_up_pct"]    = 0.0
-        ts["stock_max_dn_pct"]    = 0.0
-        ts["entry_earnings"]      = None
-        ts["entry_rv"]            = 0.0
-        ts["vix_entry"]           = None
-        ts["vix_exit"]            = None
-        ts["force_exited"]        = False
-        ts["_closing_forced"]     = False
-        ts["hedge_count"]         = 0
-        # Note: orphan_cleaned is NOT reset here — it stays True until
-        # _enter_position clears it, preventing repeated cleanup in FLAT state.
-        ts["total_fees"]          = 0.0
-        ts["call_symbol_long"]    = None
-        ts["call_symbol_short"]   = None
-        ts["long_spread_entry"]   = 0
-        ts["short_spread_entry"]  = 0
-        ts["long_spread_exit"]    = 0
-        ts["short_spread_exit"]   = 0
-
-    # ── End-of-backtest summary ───────────────────────────────────────────────
-
-    def _log(self, msg):
-        """Log a message to QC log AND collect for ObjectStore."""
-        stamped = f"{self.Time} {msg}"
-        self.Log(msg)
-        self._all_lines.append(stamped)
-
-    def _ol(self, lines, msg):
-        """Log a message AND collect it for summary + ObjectStore."""
-        self._log(msg)
-        lines.append(msg)
-
-    def OnEndOfAlgorithm(self):
-        lines = []          # collected for ObjectStore (bypasses 100 KB log cap)
-        grand_total = 0.0
-        grand_trades = 0
-        grand_wins   = 0
-        grand_hedges = 0
-        grand_attempts   = 0
-        grand_no_pair    = 0
-        grand_low_debit  = 0
-        grand_other_skip = 0
-
-        for ticker in self._ts:
-            ts = self._ts[ticker]
-            trade_log = ts["trade_log"]
-            n         = len(trade_log)
-
-            # ── Skip counters for this ticker ──
-            _att  = ts["entry_attempts"]
-            _np   = ts["skips_no_pair"]
-            _ld   = ts["skips_low_debit"]
-            _ot   = ts["skips_other"]
-            _skipped_total = _np + _ld + _ot
-            grand_attempts   += _att
-            grand_no_pair    += _np
-            grand_low_debit  += _ld
-            grand_other_skip += _ot
-
-            self._ol(lines, f"{'='*80}")
-            if n == 0:
-                self._ol(lines, f"  {ticker} SUMMARY  |  No trades completed")
-                if _att > 0:
-                    self._ol(lines, f"  Entries attempted: {_att}  |  Skipped: {_skipped_total} (no_pair={_np}, low_debit={_ld}, other={_ot})")
-                self._ol(lines, f"{'='*80}")
-                continue
-
-            totals = {"long": 0.0, "short": 0.0, "stk": 0.0, "total": 0.0, "sim": 0.0}
-            valid  = [t for t in trade_log if t["iv_exit"] != 0.0]
-            wins   = sum(1 for t in valid if t["total"] >= 0)
-            nv     = len(valid)
-            grand_trades += nv
-            grand_wins   += wins
-
-            self._ol(lines, f"  {ticker} SUMMARY  |  {nv} trade(s)  |  Wins: {wins}/{nv}  (skipped {n - nv} w/ iv_exit=0)")
-            self._ol(lines, f"  Entries attempted: {_att}  |  Skipped: {_skipped_total} (no_pair={_np}, low_debit={_ld}, other={_ot})")
-            self._ol(lines, f"{'-'*80}")
-            self._ol(lines,
-                f"  {'Earnings':<12}"
-                f" {'n':>5}"
-                f" {'Long PnL':>12}"
-                f" {'Short PnL':>12}"
-                f" {'Stock PnL':>12}"
-                f" {'MaxUp%':>8}"
-                f" {'MaxDn%':>8}"
-                f" {'Stk Chg%':>9}"
-                f" {'Combined':>12}"
-                f" {'SimPnL':>12}"
-                f" {'VIXen':>6} {'VIXex':>6}"
-                f" {'IVLen':>9}"
-                f" {'IVSen':>9}"
-                f" {'IVLex':>8}"
-                f" {'IVspread':>9}"
-                f" {'ShIV/RV':>8}"
-                f" {'IV chg':>7}"
-                f" {'IV/RV':>6}"
-                f" {'LSpEn':>7}"
-                f" {'SSpEn':>7}"
-                f" {'LSpEx':>7}"
-                f" {'SSpEx':>7}"
-                f" {'SPen':>8}"
-                f" {'SPex':>8}"
-                f" {'LPen':>8}"
-                f" {'LPex':>8}"
-                f" {'nCal':>5}"
-            )
-            self._ol(lines, f"  {'-'*160}")
-
-            skipped = 0
-            for t in trade_log:
-                if t["iv_exit"] == 0.0:
-                    skipped += 1
-                    continue
-                tag    = "[+]" if t["total"] >= 0 else "[-]"
-                rv     = t.get("rv", 0.0)
-                ratio  = f"{t['iv_entry'] / rv:.2f}" if rv > 0 else "n/a"
-                iv_chg = (t['iv_exit'] - t['iv_entry']) / t['iv_entry'] * 100 if t['iv_entry'] > 0 else 0.0
-                chg    = t.get("stk_chg_pct", 0.0)
-                iv_spr  = t.get("iv_spread_entry", 0.0)
-                sh_rv   = t.get("short_iv_rv", 0.0)
-                nc = t.get("n_contracts", 0)
-                _sim  = t.get("sim_pnl", 0.0)
-                _vixen = t.get("vix_entry")
-                _vixxs = t.get("vix_exit")
-                _vixen_s = f"{_vixen:.1f}" if _vixen else "n/a"
-                _vixxs_s = f"{_vixxs:.1f}" if _vixxs else "n/a"
-                _lse = t.get("long_spread_entry", 0)
-                _sse = t.get("short_spread_entry", 0)
-                _lsx = t.get("long_spread_exit", 0)
-                _ssx = t.get("short_spread_exit", 0)
-                _hcnt = t.get("hedge_count", 0)
-                _spen = t.get("short_put_entry_px", 0.0)
-                _spex = t.get("short_put_exit_px", 0.0)
-                _lpen = t.get("long_put_entry_px", 0.0)
-                _lpex = t.get("long_put_exit_px", 0.0)
-                self._ol(lines,
-                    f"  {tag} {t['earnings']!s:<11}"
-                    f"  {nc:>5}"
-                    f"  ${t['long_pnl']:>+10,.2f}"
-                    f"  ${t['short_pnl']:>+10,.2f}"
-                    f"  ${t['stk_pnl']:>+10,.2f}"
-                    f"  {t.get('stk_max_up_pct', 0.0):>+7.1f}%"
-                    f"  {t.get('stk_max_dn_pct', 0.0):>+7.1f}%"
-                    f"  {chg:>+7.1f}%"
-                    f"  ${t['total']:>+10,.2f}"
-                    f"  ${_sim:>+10,.2f}"
-                    f"  {_vixen_s:>6} {_vixxs_s:>6}"
-                    f"  {t['iv_entry']:>8.1%}"
-                    f"  {t.get('short_iv_entry', 0.0):>8.1%}"
-                    f"  {t['iv_exit']:>7.1%}"
-                    f"  {iv_spr:>8.1%}"
-                    f"  {sh_rv:>8.2f}"
-                    f"  {iv_chg:>+6.0f}%"
-                    f"  {ratio:>6}"
-                    f"  {_lse:>7}"
-                    f"  {_sse:>7}"
-                    f"  {_lsx:>7}"
-                    f"  {_ssx:>7}"
-                    f"  {_spen:>8.2f}"
-                    f"  {_spex:>8.2f}"
-                    f"  {_lpen:>8.2f}"
-                    f"  {_lpex:>8.2f}"
-                    f"  {nc:>5}"
-                    f"  Hdg={_hcnt}"
-                )
-                totals["long"]  += t["long_pnl"]
-                totals["short"] += t["short_pnl"]
-                totals["stk"]   += t["stk_pnl"]
-                totals["total"] += t["total"]
-                totals["sim"]   += _sim
-
-            printed = n - skipped
-            avg = totals["total"] / printed if printed > 0 else 0.0
-            self._ol(lines, f"  {'-'*160}")
-            self._ol(lines,
-                f"  {'TOTAL':<15}"
-                f"  ${totals['long']:>+10,.2f}"
-                f"  ${totals['short']:>+10,.2f}"
-                f"  ${totals['stk']:>+10,.2f}"
-                f"  {'':>8}"
-                f"  {'':>8}"
-                f"  {'':>9}"
-                f"  ${totals['total']:>+10,.2f}"
-                f"  ${totals['sim']:>+10,.2f}"
-            )
-            ticker_hedges = sum(t.get("hedge_count", 0) for t in valid)
-            avg_hedges = ticker_hedges / printed if printed > 0 else 0.0
-            self._ol(lines, f"  Avg PnL/trade: ${avg:+,.2f}  |  Hedges: {ticker_hedges} total, {avg_hedges:.1f} avg/trade")
-            if self._theta_exits > 0 and len(self._ts) == 1:
-                self._ol(lines, f"  Theta exits: {self._theta_exits}")
-            self._ol(lines, f"{'='*80}")
-            grand_total  += totals["total"]
-            grand_hedges += ticker_hedges
-
-        if len(self._ts) > 1:
-            grand_skipped = grand_no_pair + grand_low_debit + grand_other_skip
-            self._ol(lines, f"{'='*80}")
-            self._ol(lines, f"  ALL TICKERS COMBINED  |  {grand_trades} trade(s)  |  Wins: {grand_wins}/{grand_trades}  |  Max concurrent positions: {self._max_concurrent}")
-            avg_h = grand_hedges / grand_trades if grand_trades else 0.0
-            self._ol(lines, f"  Combined PnL: ${grand_total:+,.2f}  |  Avg PnL/trade: ${grand_total / grand_trades:+,.2f}  |  Hedges: {grand_hedges} total, {avg_h:.1f} avg/trade" if grand_trades else f"  Combined PnL: ${grand_total:+,.2f}")
-            self._ol(lines, f"  Total Fees:   ${self._total_fees:,.2f}  |  PnL net of fees: ${grand_total - self._total_fees:+,.2f}")
-            self._ol(lines, f"  SKIP TOTALS: {grand_attempts} attempted | {grand_trades} traded | {grand_skipped} skipped (no_pair={grand_no_pair}, low_debit={grand_low_debit}, other={grand_other_skip})")
-            if self._theta_exits > 0:
-                self._ol(lines, f"  Theta exits: {self._theta_exits}")
-            self._ol(lines, f"{'='*80}")
-
-        # ── Persist full log to ObjectStore (no 100 KB cap) ──────────────
-        # _all_lines has EVERY log line (ENTRY, EXIT, HEDGE, etc.) with timestamps
-        self.ObjectStore.Save("backtest_logs", "\n".join(self._all_lines))
+    # ── Helpers (migrated to cal_helpers.py / cal_greeks.py) ──────────────────
+    # _log, _ol, OnEndOfAlgorithm and other utility helpers are bound at the
+    # top of this class via class-attribute assignment from cal_helpers /
+    # cal_greeks. See those modules for implementations.

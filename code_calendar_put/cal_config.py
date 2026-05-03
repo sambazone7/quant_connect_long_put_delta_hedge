@@ -16,6 +16,9 @@ __all__ = [
     "FMP_API_KEY", "MANUAL_EARNINGS_DATES",
     "_fetch_earnings_fmp", "_mid",
     "NullAssignmentModel", "MidPriceFillModel",
+    "COMPUTE_OWN_GREEKS", "IV_SMOOTH_DAYS", "IV_HARD_MIN", "IV_HARD_MAX",
+    "IV_JUMP_REL", "IV_SPREAD_REL_MAX", "IV_SPREAD_ABS_MAX", "IV_VEGA_MIN",
+    "GREEKS_VERBOSE",
 ]
 
 # ─── Configurable Parameters ──────────────────────────────────────────────────
@@ -71,8 +74,22 @@ TRADE_TIME_MIN = 180      # Minutes after market open to enter/exit trades
                           # 210 → 1:00 PM ET,  330 → 3:00 PM ET
 HEDGE_TIME_MIN = 15       # Minutes before market close to run delta hedge
                           # 15 → 3:45 PM ET,  30 → 3:30 PM ET
-EXIT_DAYS_BEFORE = 1      # Trading days before short put expiry to close position
-                          # 1 → close day before expiry,  2 → two days before, etc.
+EXIT_DAYS_BEFORE = 0      # Trading days before short put expiry to close position
+                          # 0 → close on expiry day,  1 → close day before expiry,  etc.
+
+# ─── Custom Black-Scholes Greeks (see cal_greeks.py) ─────────────────────────
+# When True, _delta_hedge computes per-leg greeks via custom Black-Scholes
+# using a smoothed, outlier-filtered IV per leg (separate long & short
+# histories — never mingled). Entry-time greeks are NOT affected (always QC).
+COMPUTE_OWN_GREEKS = True
+IV_SMOOTH_DAYS     = 5      # Rolling-window length for IV averaging (trading/calendar days)
+IV_HARD_MIN        = 0.03   # Hard band: reject raw IV below 3%
+IV_HARD_MAX        = 3.00   # Hard band: reject raw IV above 300%
+IV_JUMP_REL        = 0.50   # Reject if |raw - last_smooth| / max(last_smooth, 0.10) > 50%
+IV_SPREAD_REL_MAX  = 0.50   # Reject if (ask-bid)/mid > 50% (illiquid quotes)
+IV_SPREAD_ABS_MAX  = 0.30   # Reject if (ask-bid) > $0.30 absolute (regardless of mid)
+IV_VEGA_MIN        = 0.01   # Reject if vega per 1% IV < this (IV inversion unstable)
+GREEKS_VERBOSE     = False  # If True, log custom-vs-QC greeks side-by-side per hedge
 
 # ─── Financial Modeling Prep API ──────────────────────────────────────────────
 FMP_API_KEY = ""   # Leave empty to rely solely on MANUAL_EARNINGS_DATES below
